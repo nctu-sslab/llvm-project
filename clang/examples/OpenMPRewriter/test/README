@@ -1,0 +1,2 @@
+clang -fsyntax-only -Xclang -load -Xclang /home/pschen/llvm/latest/build/lib/OpenMPRewrite.so -Xclang -plugin -Xclang omp-rewtr
+clang -fopenmp -fopenmp-targets=nvptx64

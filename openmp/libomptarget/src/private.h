@@ -17,6 +17,15 @@
 
 #include <cstdint>
 
+extern int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types);
+
+extern int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
+    void **args, int64_t *arg_sizes, int64_t *arg_types);
+
+extern int bulk_target_data_update(DeviceTy &Device, int32_t arg_num,
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types);
+
 extern int target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types);
 

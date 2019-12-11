@@ -17,11 +17,25 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*-----------------------------------*/
+#include <stdio.h>
+#define DP2(...) if(getenv("DP"))  printf(__VA_ARGS__)
+
+// Debug function
+#define PFs() DP2("[DP] Function %s start\n", __func__)
+#define PFe() DP2("[DP] Function %s end\n", __func__)
+
+// Origin flags
+#define OMPTARGET_DEBUG
+#define CUDA_ERROR_REPORT
+/*---------------------------------*/
+
 #define OFFLOAD_SUCCESS (0)
 #define OFFLOAD_FAIL (~0)
 
 #define OFFLOAD_DEVICE_DEFAULT     -1
 #define HOST_DEVICE                -10
+
 
 /// Data attributes for each data reference used in an OpenMP target region.
 enum tgt_map_type {

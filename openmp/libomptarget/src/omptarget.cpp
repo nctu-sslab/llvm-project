@@ -209,9 +209,14 @@ static int32_t member_of(int64_t type) {
   return ((type & OMP_TGT_MAPTYPE_MEMBER_OF) >> 48) - 1;
 }
 
+
 /// Internal function to do the mapping and transfer the data to the device
 int target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  if (Device.IsBulkEnabled) {
+    return bulk_target_data_begin(Device, arg_num,
+        args_base, args, arg_sizes, arg_types);
+  }
   // process each input.
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -334,9 +339,140 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
   return OFFLOAD_SUCCESS;
 }
 
+// bulk transfer version
+// NOTE
+// BULK transfer overwrite omp map ruls -> always transfer, ignore ref cnt
+// No lookup
+int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
+    void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  for (int32_t i = 0; i < arg_num; ++i) {
+    void *HstPtrBegin = args[i];
+    void *HstPtrBase = args_base[i];
+    int64_t data_size = arg_sizes[i];
+    DP2("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBegin, HstPtrBase, data_size, arg_types[i]);
+    if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
+        (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE)) {
+      DP2("Type: %lx\n", arg_types[i]);
+      continue;
+    }
+
+    int64_t padding = 0;
+    const int next_i = i+1;
+    if (member_of(arg_types[i]) < 0 && next_i < arg_num &&
+        member_of(arg_types[next_i]) == i) {
+      padding = (int64_t)HstPtrBegin % alignment;
+      if (padding) {
+        DP("Using a padding of %" PRId64 " bytes for begin address " DPxMOD
+            "\n", padding, DPxPTR(HstPtrBegin));
+        HstPtrBegin = (char *) HstPtrBegin - padding;
+        data_size += padding;
+      }
+    }
+    // Same as default end
+
+    void *Pointer_HstPtrBegin;
+    bool IsNew, Pointer_IsNew;
+    bool IsImplicit = arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT;
+    // UpdateRef is based on MEMBER_OF instead of TARGET_PARAM because if we
+    // have reached this point via __tgt_target_data_begin and not __tgt_target
+    // then no argument is marked as TARGET_PARAM ("omp target data map" is not
+    // associated with a target region, so there are no target parameters). This
+    // may be considered a hack, we could revise the scheme in the future.
+    bool UpdateRef = !(arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF);
+    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      //DP("Has a pointer entry: \n");
+      // base is address of pointer.
+      //Pointer_TgtPtrBegin = 
+      //Device.getOrAllocTgtPtr(HstPtrBase, HstPtrBase,
+      //    sizeof(void *), Pointer_IsNew, IsImplicit, true);
+      //DP("There are %zu bytes allocated at target address " DPxMOD " - is%s new"
+      //    "\n", sizeof(void *), DPxPTR(Pointer_TgtPtrBegin),
+      //    (Pointer_IsNew ? "" : " not"));
+      // modify current entry.
+      // FIXME
+      /*Pointer_HstPtrBegin = HstPtrBase;
+      HstPtrBase = *(void **)HstPtrBase;
+      UpdateRef = true; // subsequently update ref count of pointee
+      */
+    }
+
+    //void *TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBegin, HstPtrBase,
+        //data_size, IsNew, IsImplicit, UpdateRef);
+    //if (!TgtPtrBegin && data_size) {
+      // If data_size==0, then the argument could be a zero-length pointer to
+      // NULL, so getOrAlloc() returning NULL is not an error.
+     // DP("Call to getOrAllocTgtPtr returned null pointer (device failure or "
+     //     "illegal mapping).\n");
+    //}
+    /*DP("There are %" PRId64 " bytes allocated at target address " DPxMOD
+        " - is%s new\n", data_size, DPxPTR(TgtPtrBegin),
+        (IsNew ? "" : " not"));
+
+        */
+    if (arg_types[i] & OMP_TGT_MAPTYPE_RETURN_PARAM) {
+      /*uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)HstPtrBase;
+      void *TgtPtrBase = (void *)((uintptr_t)TgtPtrBegin - Delta);
+      DP("Returning device pointer " DPxMOD "\n", DPxPTR(TgtPtrBase));
+      args_base[i] = TgtPtrBase;
+      */
+      assert(0 && "OMP_TGT_MAPTYPE_RETURN_PARAM encountered");
+    }
+
+    if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+      bool copy = false;
+      /*if ((arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS)) {
+        copy = true;
+      } else if (arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) {
+        // Copy data only if the "parent" struct has RefCount==1.
+        copy = true;
+        int32_t parent_idx = member_of(arg_types[i]);
+        long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
+        assert(parent_rc > 0 && "parent struct not found");
+        if (parent_rc == 1) {
+          copy = true;
+        }
+      }*/
+
+      // Always copy
+      copy = true;
+      if (copy) {
+        DP2("Add to region bulk %" PRId64 " bytes (hst:" DPxMOD ")\n",
+            data_size, DPxPTR(HstPtrBegin) );
+        Device.bulk_map_to( HstPtrBegin, data_size);
+        //int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
+      }
+    }
+
+    // Update Ptr
+    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      //DP2("\nHstPtrBase %p %p\n\n", HstPtrBase, HstPtrBegin);
+      DP2("Suspend update pointer (" DPxMOD ") <- [" DPxMOD"]\n",
+          DPxPTR(HstPtrBase), DPxPTR(HstPtrBegin));
+      //uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
+      //void *TgtPtrBase = (void *)((uint64_t)TgtPtrBegin - Delta);
+      
+      //Device.ShadowMtx.lock();
+      //                    Addr           Ptr Value
+      Device.suspend_update(HstPtrBase,HstPtrBegin);
+
+      // create shadow pointers for this entry
+      // TODO how to handle ShadowPtrMap
+      //Device.ShadowPtrMap[Pointer_HstPtrBegin] = {HstPtrBase,
+      //    Pointer_TgtPtrBegin, TgtPtrBase};
+      //Device.ShadowMtx.unlock();
+    }
+  }
+  PFe();
+  return OFFLOAD_SUCCESS;
+}
+
 /// Internal function to undo the mapping and retrieve the data from the device.
 int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  if (Device.IsBulkEnabled) {
+    return bulk_target_data_end(Device, arg_num,
+        args_base, args, arg_sizes, arg_types);
+  }
   // process each input.
   for (int32_t i = arg_num - 1; i >= 0; --i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -374,6 +510,7 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     DP("There are %" PRId64 " bytes allocated at target address " DPxMOD
         " - is%s last\n", data_size, DPxPTR(TgtPtrBegin),
         (IsLast ? "" : " not"));
+
 
     bool DelEntry = IsLast || ForceDelete;
 
@@ -456,6 +593,113 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
       }
     }
   }
+
+  return OFFLOAD_SUCCESS;
+}
+
+int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
+    void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  PFs();
+  for (int32_t i = arg_num - 1; i >= 0; --i) {
+    if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
+        (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE)) {
+      DP("Type: %" PRId64 "\n", arg_types[i]);
+      continue;
+    }
+
+    void *HstPtrBegin = args[i];
+    int64_t data_size = arg_sizes[i];
+    DP2("Addr:" DPxMOD " Base:" DPxMOD " size: %" PRId64 " type: 0x%lx\n", DPxPTR(HstPtrBegin), DPxPTR(args_base[i]), data_size, arg_types[i]);
+    // Adjust for proper alignment if this is a combined entry (for structs).
+    // Look at the next argument - if that is MEMBER_OF this one, then this one
+    // is a combined entry.
+    int64_t padding = 0;
+    const int next_i = i+1;
+    if (member_of(arg_types[i]) < 0 && next_i < arg_num &&
+        member_of(arg_types[next_i]) == i) {
+      padding = (int64_t)HstPtrBegin % alignment;
+      if (padding) {
+        DP2("Using a padding of %" PRId64 " bytes for begin address " DPxMOD
+            "\n", padding, DPxPTR(HstPtrBegin));
+        HstPtrBegin = (char *) HstPtrBegin - padding;
+        data_size += padding;
+      }
+    }
+
+    // If PTR_AND_OBJ, HstPtrBegin is address of pointee
+    void *TgtPtrBegin = Device.bulkLookupMapping(HstPtrBegin, data_size);
+    DP2("There are %" PRId64 " bytes allocated at target address " DPxMOD
+        " \n", data_size, DPxPTR(TgtPtrBegin)
+        );
+
+    if ((arg_types[i] & OMP_TGT_MAPTYPE_FROM)) {
+      // Move data back to the host
+      if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
+        //DP("Moving %" PRId64 " bytes (tgt:" DPxMOD ") -> (hst:" DPxMOD ")\n",
+        //    data_size, DPxPTR(TgtPtrBegin), DPxPTR(HstPtrBegin));
+        //int rt = Device.data_retrieve(HstPtrBegin, TgtPtrBegin, data_size);
+        int rt = Device.bulk_map_from(HstPtrBegin,data_size);
+        if (rt != OFFLOAD_SUCCESS) {
+          DP2("Copying data from device failed.\n");
+          return OFFLOAD_FAIL;
+        }
+      }
+      //TODO ShadowMap 
+      // If we copied back to the host a struct/array containing pointers, we
+      // need to restore the original host pointer values from their shadow
+      // copies. If the struct is going to be deallocated, remove any remaining
+      // shadow pointer entries for this struct.
+      uintptr_t lb = (uintptr_t) HstPtrBegin;
+      uintptr_t ub = (uintptr_t) HstPtrBegin + data_size;
+      Device.ShadowMtx.lock();
+      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+           it != Device.ShadowPtrMap.end();) {
+        void **ShadowHstPtrAddr = (void**) it->first;
+
+        // An STL map is sorted on its keys; use this property
+        // to quickly determine when to break out of the loop.
+        if ((uintptr_t) ShadowHstPtrAddr < lb) {
+          ++it;
+          continue;
+        }
+        if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;
+
+        // If we copied the struct to the host, we need to restore the pointer.
+        if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
+          DP2("lb: " DPxMOD " ub:" DPxMOD " \n", DPxPTR(lb), DPxPTR(ub));
+          DP2("Restoring original host pointer value " DPxMOD " for host "
+              "pointer " DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
+              DPxPTR(ShadowHstPtrAddr));
+          *ShadowHstPtrAddr = it->second.HstPtrVal;
+          DP2("" DPxMOD " -> " DPxMOD "\n", DPxPTR((void*)ShadowHstPtrAddr), DPxPTR(it->second.HstPtrVal));
+        }
+        // If the struct is to be deallocated, remove the shadow entry.
+        /*
+        if (DelEntry) {
+          DP("Removing shadow pointer " DPxMOD "\n", DPxPTR(ShadowHstPtrAddr));
+          it = Device.ShadowPtrMap.erase(it);
+        } else {
+          ++it;
+        }
+        */
+        ++it;
+      }
+      Device.ShadowMtx.unlock();
+    }
+  }
+      
+
+      // Deallocate map
+      /*
+      if (DelEntry) {
+        int rt = Device.deallocTgtPtr(HstPtrBegin, data_size, ForceDelete);
+        if (rt != OFFLOAD_SUCCESS) {
+          DP("Deallocating data from device failed.\n");
+          return OFFLOAD_FAIL;
+        }
+      }
+      */
 
   return OFFLOAD_SUCCESS;
 }
@@ -618,6 +862,13 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     return OFFLOAD_FAIL;
   }
 
+  if (Device.IsBulkEnabled) {
+    Device.bulk_transfer();
+    Device.dump_regions();
+    Device.update_suspend_list();
+  }
+
+
   std::vector<void *> tgt_args;
   std::vector<ptrdiff_t> tgt_offsets;
 
@@ -732,7 +983,7 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   uint64_t ltc = Device.loopTripCnt;
   Device.loopTripCnt = 0;
 
-  // Launch device execution.
+  // Launch device execution
   DP("Launching target execution %s with pointer " DPxMOD " (index=%d).\n",
       TargetTable->EntriesBegin[TM->Index].name,
       DPxPTR(TargetTable->EntriesBegin[TM->Index].addr), TM->Index);
@@ -761,6 +1012,9 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   // Move data from device.
   int rt = target_data_end(Device, arg_num, args_base, args, arg_sizes,
       arg_types);
+  if (Device.IsBulkEnabled) {
+    //rt = Device.bulk_transfer();
+  }
   if (rt != OFFLOAD_SUCCESS) {
     DP("Call to target_data_end failed, abort targe.\n");
     return OFFLOAD_FAIL;

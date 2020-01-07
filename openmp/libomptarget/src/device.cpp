@@ -159,19 +159,18 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
 }
 
 void *DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
-  PFs();
   void *TgtPtrBegin = NULL;
   if (IsBulkEnabled) {
     // FIXME  lower latency
     // FIXME Add extend check
-    auto entry = RegionList.lower_bound((uintptr_t)HstPtrBegin);
+    auto entry = RegionList.lower_bound((intptr_t)HstPtrBegin);
     bool IsContained = false;
     bool ExtendsBefore = false;
     bool ExtendsAfter = false;
     if (entry != RegionList.end()) {
     //    DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
-      if ((uintptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
-        if ((uintptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
+      if ((intptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
+        if ((intptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
           IsContained = true;
           TgtPtrBegin = (void*)((intptr_t)HstPtrBegin + entry->second.bias);
         } else {
@@ -179,7 +178,7 @@ void *DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
         }
       } else if (entry != RegionList.begin()) {
         // check higher
-        if ((uintptr_t) HstPtrBegin + Size < (--entry)->second.HstPtrEnd) {
+        if ((intptr_t) HstPtrBegin + Size < (--entry)->second.HstPtrEnd) {
           ExtendsBefore = true;
         }
       }
@@ -255,7 +254,6 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
     bool UpdateRefCount) {
   void *rc = NULL;
   if (IsBulkEnabled) {
-    PFs();
     void *rc = bulkLookupMapping(HstPtrBegin, Size);
     return rc;
   }
@@ -289,7 +287,6 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
 void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
   uintptr_t hp = (uintptr_t)HstPtrBegin;
   if (IsBulkEnabled) {
-    PFs();
     void *rc = bulkLookupMapping(HstPtrBegin, Size);
     return rc;
   }
@@ -340,9 +337,17 @@ void DeviceTy::init() {
     RTL->init_requires(RTLRequiresFlags);
   int32_t rc = RTL->init_device(RTLDeviceID);
   if (rc == OFFLOAD_SUCCESS) {
-    if (getenv("OMP_BULK")) {
-      DP2("Bulk enabled\n");
+    if (getenv("OMP_AT")) {
+      DP2("Address Translate Enabled\n");
+      IsATEnabled = true;
+    } else {
+      IsATEnabled = false;
+    }
+    if (getenv("OMP_BULK") || IsATEnabled) {
+      DP2("Bulk Transfer Enabled\n");
       IsBulkEnabled = true;
+    } else {
+      IsBulkEnabled = false;
     }
     IsInit = true;
   }
@@ -385,14 +390,15 @@ int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
 }
 
 // Add pointer update to suspend list.
-int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue) {
-  UpdatePtrTy upl = {HstPtrBaseAddr, HstPtrValue};
+int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, void *OldHstPtrBase, void* NewHstPtrBase) {
+  UpdatePtrTy upl = {HstPtrBaseAddr, HstPtrValue, OldHstPtrBase, NewHstPtrBase};
   UpdatePtrList.push(upl);
   return 0;
 }
 
 // Update the suspend list
 int32_t DeviceTy::update_suspend_list() {
+  PFs();
   int32_t ret;
 
   //struct UpdatePtrTy upt;
@@ -401,7 +407,9 @@ int32_t DeviceTy::update_suspend_list() {
   while (!UpdatePtrList.empty()) {
     struct UpdatePtrTy &upt = UpdatePtrList.front();
     void *PtrBaseAddr = bulkLookupMapping(upt.PtrBaseAddr,sizeof(void*));
-    void *PtrValue = bulkLookupMapping(upt.PtrValue,sizeof(void*));
+    //uintptr_t Delta = (intptr_t)upt.PtrValue - (intptr_t)upt.PtrBaseAddr;
+    void *PtrValue = (void*)((uintptr_t)bulkLookupMapping(upt.PtrValue,sizeof(void*)));
+    //DP2("Delta: %ld\n", Delta);
     DP2("Update pointer (" DPxMOD ") <- [" DPxMOD "]\n",
                   DPxPTR(PtrBaseAddr), DPxPTR(PtrValue));
     ret = data_submit(PtrBaseAddr,  &PtrValue, sizeof(void*));
@@ -410,28 +418,27 @@ int32_t DeviceTy::update_suspend_list() {
       return ret;
     }
     ShadowMtx.lock();
-    ShadowPtrMap[upt.PtrBaseAddr] = {upt.PtrValue, PtrValue, PtrBaseAddr};
+    //ShadowPtrMap[upt.PtrAddr] = {upt.PtrValue, PtrValue, PtrBaseAddr};
+    //ShadowPtrMap[upt.PtrValue] = {upt.PtrAddr, PtrValue, PtrBaseAddr};
+    //           old ptr base  new ptr base
+    ShadowPtrMap[upt.OldHstPtrBase] = {upt.NewHstPtrBase, PtrBaseAddr,PtrValue};
     ShadowMtx.unlock();
 
     UpdatePtrList.pop();
     ++i;
   }
-  //fDP2(stdout, "Submit all %d suspended ptr\n", i);
   return 0;
 }
 
 int32_t DeviceTy::dump_regions() {
-  DP2("-------------------------------\n");
-  DP2("\tDump RegionList\n");
-  DP2("\tSize :%lu\n", RegionList.size());
+  DP2("--- Dump RegionList -----------\n");
+  DP2("|\tSize :%lu\n", RegionList.size());
   auto it = RegionList.begin();
   while (it != RegionList.end()) {
-    void *HstBegin = (void*)it->second.HstPtrBegin;
-    void *HstEnd = (void*)it->second.HstPtrEnd;
-    uintptr_t Size = (uintptr_t)HstEnd - (uintptr_t)HstBegin;
-    DP2("  Key:%p,Begin:%p End:%p Size:%lu ", (void*)it->first,HstBegin, HstEnd, Size);
-    DP2("Tgt:%p Bias:%ld\n", (void*)it->second.TgtPtrBegin, it->second.bias);
+    DP2("|%s\n", it->second.getString().c_str());
     it++;
+    // Add size?
+    //DP2("|[%p:%p] Size:%lu Tgt:%p\n", HstBegin, HstEnd, Size, (void*)it->second.TgtPtrBegin);
   }
   DP2("-------------------------------\n");
   return 0;
@@ -455,7 +462,6 @@ int32_t DeviceTy::run_team_region(void *TgtEntryPtr, void **TgtVarsPtr,
 
 // bulk transfer depends on Transfer type
 int32_t DeviceTy::bulk_transfer() {
-  PFs();
   auto it = RegionList.begin();
   void *TgtPtrBegin;
   while (it != RegionList.end()) {
@@ -467,20 +473,18 @@ int32_t DeviceTy::bulk_transfer() {
       void *TgtPtrBegin = bulkLookupMapping((void*)it->second.HstPtrBegin, size);
       if (TgtPtrBegin) {
         data_retrieve((void*)it->second.HstPtrBegin, TgtPtrBegin, size);
-        DP2("[D]%p -> [H]%p\n", TgtPtrBegin, (void*)it->second.HstPtrBegin);
       }
     } else if (Transfer == TransferTo) {
       bool IsNew = false;
       if (!it->second.TgtPtrBegin) {
         IsNew = true;
 			  TgtPtrBegin = RTL->data_alloc(RTLDeviceID, size, NULL);
-    	  it->second.TgtPtrBegin = (uintptr_t)TgtPtrBegin;
+    	  it->second.TgtPtrBegin = (intptr_t)TgtPtrBegin;
         it->second.bias = (intptr_t)TgtPtrBegin - (intptr_t) it->second.HstPtrBegin;
       }
       data_submit(TgtPtrBegin,(void*)it->second.HstPtrBegin,size);
-      DP2("[H]%p -> [D]%p is %s\n",  (void*)it->second.HstPtrBegin, TgtPtrBegin, IsNew ? "new":"not new");
     } else {
-      DP2("Error \n");
+      DP2("Error unrecognized transfer type \n");
     }
     it++;
   }
@@ -488,7 +492,6 @@ int32_t DeviceTy::bulk_transfer() {
 }
 
 int32_t DeviceTy::bulk_map_from( void *HstPtrBegin, size_t Size) {
-  PFs();
   /*
   if (Transfer != TransferFrom) {
     RegionList.clear();
@@ -500,7 +503,11 @@ int32_t DeviceTy::bulk_map_from( void *HstPtrBegin, size_t Size) {
   void *TgtPtrBegin = bulkLookupMapping(HstPtrBegin, Size);
   if (TgtPtrBegin) {
     data_retrieve(HstPtrBegin, TgtPtrBegin, Size);
-    DP2("Write to %p size %zu\n", HstPtrBegin, Size);
+    /*
+    if (Size == 4) {
+      DP2("Retrieve %p val: %d\n", HstPtrBegin, *(int*)HstPtrBegin);
+    }
+    */
     return OFFLOAD_SUCCESS;
   }
   return OFFLOAD_FAIL;
@@ -509,31 +516,38 @@ int32_t DeviceTy::bulk_map_from( void *HstPtrBegin, size_t Size) {
 int32_t DeviceTy::bulk_map_to( void *HstPtrBegin, size_t Size) {
   if (Transfer != TransferTo) {
     RegionList.clear();
-    DP2("Device clean regions\n");
     Transfer = TransferTo;
   }
   return bulk_add(HstPtrBegin, Size);
 }
 
+void *DeviceTy::table_transfer(std::vector <RegionTy>table) {
+  int table_size = table.size() * sizeof(RegionTy);
+  void *tgt_table = RTL->data_alloc(RTLDeviceID, table_size, NULL);
+  data_submit(tgt_table, &table[0],table_size);
+  return tgt_table;
+}
+
 int32_t DeviceTy::bulk_add(void *HstPtrBegin, size_t Size) {
-  //uintptr_t threshold = 1000;
-  uintptr_t threshold = getpagesize();
-  PFs();
+  //intptr_t threshold = 1000;
+  intptr_t threshold = getpagesize();
   // NOTE we use signed int to compute ptr
   intptr_t HstPtrBeginNew = (intptr_t) HstPtrBegin;
   intptr_t HstPtrEndNew = (intptr_t) HstPtrBegin + Size;
   intptr_t HstPtrBeginCur, HstPtrEndCur;
   
-  auto it = RegionList.lower_bound((uintptr_t)HstPtrBegin);
+  auto it = RegionList.lower_bound((intptr_t)HstPtrBegin);
   // HstPtrBegin <= it
 
+  //Merge
   bool extend_high = false;
   bool extend_low = false;
+
+  // FIXME contain is not correct
   bool contain = false;
-  // Check belong
-  // <-- back forward--->
-  // Big ---------- Small
-  //dump_regions();
+
+  // Region list  <-- back--   ++forward--->
+  //              High addr ---------- Low addr
   // Check forward
   if (it != RegionList.end()) {
     HstPtrBeginCur = (intptr_t) it->second.HstPtrBegin;
@@ -547,24 +561,24 @@ int32_t DeviceTy::bulk_add(void *HstPtrBegin, size_t Size) {
         HstPtrEndNew = HstPtrEndCur;
       }
     } 
-    // Check previous region, higher addr
-    if (!contain && it != RegionList.begin()) {
-      //DP2("Check previous\n");
-      it--;
-      HstPtrBeginCur = (intptr_t)  it->second.HstPtrBegin;
-      HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
-      if (HstPtrBeginCur - HstPtrEndNew < threshold) {
-        contain  = true;
-        HstPtrBeginNew = HstPtrBeginCur;
-        if (HstPtrEndNew > HstPtrEndCur) {
-          extend_high = true;
-          //DP2("Extend high-> %p \n", (void*) HstPtrBeginCur);
-        } else {
-          HstPtrEndNew = HstPtrEndCur;
-        }
+  }
+  // Check backward, higher addr
+  if (!contain && it != RegionList.begin()) {
+    it--;
+    HstPtrBeginCur = (intptr_t)  it->second.HstPtrBegin;
+    HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
+    if (HstPtrBeginCur - HstPtrEndNew < threshold) {
+      contain  = true;
+      // FIXME next line is useless?
+      //HstPtrBeginNew = HstPtrBeginCur < HstPtrEndNew ? HstPtrEndCur : HstPtrEndNew;
+      if (HstPtrEndNew > HstPtrEndCur) {
+        extend_high = true;
+      } else {
+        HstPtrEndNew = HstPtrEndCur;
       }
     }
   }
+
   auto cur = it;
   if (extend_high) {
     while (cur != RegionList.begin()) {
@@ -572,20 +586,24 @@ int32_t DeviceTy::bulk_add(void *HstPtrBegin, size_t Size) {
       if ((intptr_t) cur->second.HstPtrEnd - HstPtrBeginNew < threshold) {
         HstPtrBeginCur = (intptr_t) cur->second.HstPtrBegin;
         HstPtrBeginNew = HstPtrBeginCur > HstPtrBeginNew ? HstPtrBeginNew : HstPtrBeginCur;
-        //DP2("Merged %p\n", (void*)cur->second.HstPtrBegin);
+        DP2("Merged %s\n", (void*)cur->second.getString().c_str());
         // Remove region
         RegionList.erase(cur--);
       }
     }
   }
-  // FIXME new struct??
   if (contain) {
     RegionList.erase(it);
   }
   RegionTy r;
-  r.HstPtrBegin = (uintptr_t) HstPtrBeginNew;
-  r.HstPtrEnd = (uintptr_t) HstPtrEndNew;
-  RegionList[(uintptr_t) HstPtrBeginNew] = r;
+  r.HstPtrBegin = (intptr_t) HstPtrBeginNew;
+  r.HstPtrEnd = (intptr_t) HstPtrEndNew;
+  RegionList[(intptr_t) HstPtrBeginNew] = r;
+  if (contain) {
+    DP2("Added [%p,%p] to region: %s, extend_high: %d\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, r.getString().c_str(), extend_high);
+  } else {
+    DP2("New region [%p,%p]\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size);
+  }
   return contain;
 }
 

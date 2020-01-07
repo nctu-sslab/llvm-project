@@ -20,11 +20,11 @@
 #include <cassert>
 #include <vector>
 
+#include "at.h"
+
 #ifdef OMPTARGET_DEBUG
 int DebugLevel = 0;
 #endif // OMPTARGET_DEBUG
-
-
 
 /* All begin addresses for partially mapped structs must be 8-aligned in order
  * to ensure proper alignment of members. E.g.
@@ -349,12 +349,13 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
     void *HstPtrBegin = args[i];
     void *HstPtrBase = args_base[i];
     int64_t data_size = arg_sizes[i];
-    DP2("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBegin, HstPtrBase, data_size, arg_types[i]);
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE)) {
-      DP2("Type: %lx\n", arg_types[i]);
+      DP2("Value: %" PRId64 " Size: %" PRId64 " Type: 0x%lx\n", (intptr_t) HstPtrBegin, data_size, arg_types[i]);
       continue;
     }
+
+    DP2("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBegin, HstPtrBase, data_size, arg_types[i]);
 
     int64_t padding = 0;
     const int next_i = i+1;
@@ -390,8 +391,9 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       //    (Pointer_IsNew ? "" : " not"));
       // modify current entry.
       // FIXME
-      /*Pointer_HstPtrBegin = HstPtrBase;
+      Pointer_HstPtrBegin = HstPtrBase;
       HstPtrBase = *(void **)HstPtrBase;
+      /*
       UpdateRef = true; // subsequently update ref count of pointee
       */
     }
@@ -436,33 +438,29 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       // Always copy
       copy = true;
       if (copy) {
-        DP2("Add to region bulk %" PRId64 " bytes (hst:" DPxMOD ")\n",
-            data_size, DPxPTR(HstPtrBegin) );
+        //DP2("Add to region bulk %" PRId64 " bytes (hst:" DPxMOD ")\n",
+        //    data_size, DPxPTR(HstPtrBegin) );
         Device.bulk_map_to( HstPtrBegin, data_size);
         //int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
       }
     }
 
     // Update Ptr
+    
+    if (Device.IsATEnabled) {
+      continue;
+    }
     if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      uintptr_t Delta = (uintptr_t) HstPtrBegin - (uintptr_t) HstPtrBase;
+      void *UpdateValue =(void*)((uintptr_t)HstPtrBegin - Delta);
       //DP2("\nHstPtrBase %p %p\n\n", HstPtrBase, HstPtrBegin);
       DP2("Suspend update pointer (" DPxMOD ") <- [" DPxMOD"]\n",
-          DPxPTR(HstPtrBase), DPxPTR(HstPtrBegin));
-      //uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
-      //void *TgtPtrBase = (void *)((uint64_t)TgtPtrBegin - Delta);
+          DPxPTR(Pointer_HstPtrBegin), DPxPTR(UpdateValue));
       
-      //Device.ShadowMtx.lock();
       //                    Addr           Ptr Value
-      Device.suspend_update(HstPtrBase,HstPtrBegin);
-
-      // create shadow pointers for this entry
-      // TODO how to handle ShadowPtrMap
-      //Device.ShadowPtrMap[Pointer_HstPtrBegin] = {HstPtrBase,
-      //    Pointer_TgtPtrBegin, TgtPtrBase};
-      //Device.ShadowMtx.unlock();
+      Device.suspend_update(Pointer_HstPtrBegin, UpdateValue, Pointer_HstPtrBegin, HstPtrBase);
     }
   }
-  PFe();
   return OFFLOAD_SUCCESS;
 }
 
@@ -599,7 +597,6 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
 
 int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     void **args, int64_t *arg_sizes, int64_t *arg_types) {
-  PFs();
   for (int32_t i = arg_num - 1; i >= 0; --i) {
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE)) {
@@ -619,7 +616,7 @@ int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
         member_of(arg_types[next_i]) == i) {
       padding = (int64_t)HstPtrBegin % alignment;
       if (padding) {
-        DP2("Using a padding of %" PRId64 " bytes for begin address " DPxMOD
+        DP("Using a padding of %" PRId64 " bytes for begin address " DPxMOD
             "\n", padding, DPxPTR(HstPtrBegin));
         HstPtrBegin = (char *) HstPtrBegin - padding;
         data_size += padding;
@@ -628,7 +625,7 @@ int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
 
     // If PTR_AND_OBJ, HstPtrBegin is address of pointee
     void *TgtPtrBegin = Device.bulkLookupMapping(HstPtrBegin, data_size);
-    DP2("There are %" PRId64 " bytes allocated at target address " DPxMOD
+    DP("There are %" PRId64 " bytes allocated at target address " DPxMOD
         " \n", data_size, DPxPTR(TgtPtrBegin)
         );
 
@@ -667,12 +664,10 @@ int bulk_target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
 
         // If we copied the struct to the host, we need to restore the pointer.
         if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
-          DP2("lb: " DPxMOD " ub:" DPxMOD " \n", DPxPTR(lb), DPxPTR(ub));
           DP2("Restoring original host pointer value " DPxMOD " for host "
               "pointer " DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
               DPxPTR(ShadowHstPtrAddr));
           *ShadowHstPtrAddr = it->second.HstPtrVal;
-          DP2("" DPxMOD " -> " DPxMOD "\n", DPxPTR((void*)ShadowHstPtrAddr), DPxPTR(it->second.HstPtrVal));
         }
         // If the struct is to be deallocated, remove the shadow entry.
         /*
@@ -865,9 +860,31 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   if (Device.IsBulkEnabled) {
     Device.bulk_transfer();
     Device.dump_regions();
-    Device.update_suspend_list();
+
+    if (!Device.IsATEnabled) {
+      Device.update_suspend_list();
+    }
   }
 
+  if (Device.IsATEnabled) {
+    // convert region list to table
+    std::vector <RegionTy>table;
+    for (auto it : Device.RegionList) {
+      table.push_back(it.second);
+    }
+    // Transfer table
+    DP2("Transfered at table\n");
+    void *tgt_table = Device.table_transfer(table);
+    // Add tgt table
+    AT.addTable(tgt_table);
+    AT.addTableSize(table.size());
+
+    int fake_table_size = 13;
+    int fake_table_byte = fake_table_size * sizeof(struct RegionTy);
+    //DP2("Expected size: %d\n", fake_table_size);
+    AT.addFakeByte(fake_table_byte);
+    AT.addFakeSize(fake_table_size);
+  }
 
   std::vector<void *> tgt_args;
   std::vector<ptrdiff_t> tgt_offsets;
@@ -924,7 +941,12 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       DP("Forwarding first-private value " DPxMOD " to the target construct\n",
           DPxPTR(HstPtrBase));
       TgtPtrBegin = HstPtrBase;
+      //pschen
+      if (Device.IsATEnabled) {
+        TgtPtrBegin = AT.passLiteral(HstPtrBase, arg_sizes[i]);
+      }
       TgtBaseOffset = 0;
+
     } else if (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE) {
       // Allocate memory for (first-)private array
       TgtPtrBegin = Device.RTL->data_alloc(Device.RTLDeviceID,
@@ -965,6 +987,11 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
       TgtBaseOffset = (intptr_t)HstPtrBase - (intptr_t)HstPtrBegin;
+
+      // pschen
+      if (Device.IsATEnabled) {
+        TgtPtrBegin = AT.passArg(TgtPtrBegin, arg_sizes[i]);
+      }
 #ifdef OMPTARGET_DEBUG
       void *TgtPtrBase = (void *)((intptr_t)TgtPtrBegin + TgtBaseOffset);
       DP("Obtained target argument " DPxMOD " from host pointer " DPxMOD "\n",

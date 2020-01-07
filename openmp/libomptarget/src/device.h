@@ -21,6 +21,7 @@
 #include <vector>
 #include <queue>
 
+
 // Forward declarations.
 struct RTLInfoTy;
 struct __tgt_bin_desc;
@@ -84,6 +85,8 @@ typedef std::map<__tgt_bin_desc *, PendingCtorDtorListsTy>
 struct UpdatePtrTy {
   void *PtrBaseAddr;
   void *PtrValue;
+  void *OldHstPtrBase;
+  void *NewHstPtrBase;
 };
 
 typedef std::queue<UpdatePtrTy> UpdatePtrListTy;
@@ -92,10 +95,14 @@ struct RegionTy {
   RegionTy() {
     TgtPtrBegin = 0;
   }
+  void dump();
+  std::string getString();
+
   uintptr_t HstPtrBegin;
   uintptr_t HstPtrEnd;
   uintptr_t TgtPtrBegin;
   intptr_t bias;
+
 };
 
 // Better for lookup
@@ -112,9 +119,6 @@ struct DeviceTy {
 
   HostDataToTargetListTy HostDataToTargetMap;
   PendingCtorsDtorsPerLibrary PendingCtorsDtors;
-
-  UpdatePtrListTy UpdatePtrList;
-  RegionListTy RegionList;
 
   ShadowPtrListTy ShadowPtrMap;
 
@@ -182,14 +186,18 @@ struct DeviceTy {
       int32_t ThreadLimit, uint64_t LoopTripCount);
 
   // pschen custom
+  UpdatePtrListTy UpdatePtrList;
+  RegionListTy RegionList;
+
   bool IsBulkEnabled;
+  bool IsATEnabled;
   enum TransferType {
     TransferNone,
     TransferTo,
     TransferFrom
   };
   enum TransferType Transfer = TransferNone;
-  int32_t suspend_update(void *TgtPtrAddr, void *TgtPtrValue);
+  int32_t suspend_update(void *TgtPtrAddr, void *TgtPtrValue, void* OldBase, void*NewBase);
   int32_t update_suspend_list();
   int32_t dump_regions();
 
@@ -198,6 +206,7 @@ struct DeviceTy {
   int32_t bulk_map_from(void *HstPtrBegin, size_t size);
   int32_t bulk_add(void *HstPtrBegin, size_t size);
   int32_t bulk_transfer();
+  void *table_transfer(std::vector<RegionTy> table);
   void *bulkLookupMapping(void *HstPtrBegin, int64_t Size);
 private:
   // Call to RTL

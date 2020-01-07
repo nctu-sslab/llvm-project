@@ -19,11 +19,13 @@
 
 /*-----------------------------------*/
 #include <stdio.h>
-#define DP2(...) if(getenv("DP"))  printf(__VA_ARGS__)
+#include <stdlib.h>
+#include <math.h>
+#define DP2(...) if(getenv("DP2"))  printf("[omp-dc] " __VA_ARGS__)
 
 // Debug function
-#define PFs() DP2("[DP] Function %s start\n", __func__)
-#define PFe() DP2("[DP] Function %s end\n", __func__)
+#define PFs() DP2("Function %s start\n", __func__)
+#define PFe() DP2("Function %s end\n", __func__)
 
 // Origin flags
 #define OMPTARGET_DEBUG

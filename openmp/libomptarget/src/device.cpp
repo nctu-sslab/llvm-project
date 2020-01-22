@@ -27,7 +27,7 @@ int DeviceTy::associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size) {
   DataMapMtx.lock();
 
   if (IsBulkEnabled) {
-     assert(0 && __func__ " shall not used");
+     assert(0 && "associatePtr shall not used");
   }
   // Check if entry exists
   for (auto &HT : HostDataToTargetMap) {
@@ -75,7 +75,7 @@ int DeviceTy::disassociatePtr(void *HstPtrBegin) {
   DataMapMtx.lock();
 
   if (IsBulkEnabled) {
-     assert(0 && __func__ " shall not used");
+     assert(0 && "disassociatePtr shall not used");
   }
   // Check if entry exists
   for (HostDataToTargetListTy::iterator ii = HostDataToTargetMap.begin();
@@ -158,39 +158,6 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
   return lr;
 }
 
-void *DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
-  void *TgtPtrBegin = NULL;
-  if (IsBulkEnabled) {
-    // FIXME  lower latency
-    // FIXME Add extend check
-    auto entry = RegionList.lower_bound((intptr_t)HstPtrBegin);
-    bool IsContained = false;
-    bool ExtendsBefore = false;
-    bool ExtendsAfter = false;
-    if (entry != RegionList.end()) {
-    //    DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
-      if ((intptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
-        if ((intptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
-          IsContained = true;
-          TgtPtrBegin = (void*)((intptr_t)HstPtrBegin + entry->second.bias);
-        } else {
-          ExtendsAfter  = true;
-        }
-      } else if (entry != RegionList.begin()) {
-        // check higher
-        if ((intptr_t) HstPtrBegin + Size < (--entry)->second.HstPtrEnd) {
-          ExtendsBefore = true;
-        }
-      }
-    }
-  } else {
-    DP2("ERROR, bulkLookupMapping should not be called\n");
-  }
-  if (!TgtPtrBegin) {
-    DP2("ERROR, bulkLookupMapping no region found:%p %ld\n", HstPtrBegin, Size);
-  }
-  return TgtPtrBegin;
-}
 
 
 // Used by target_data_begin
@@ -202,11 +169,6 @@ void *DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
 void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
   void *rc = NULL;
-  if (IsBulkEnabled) {
-    DP2("Dont do this\n");
-    return rc;
-    rc = bulkLookupMapping(HstPtrBegin, Size);
-  }
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
 
@@ -233,7 +195,14 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
   } else if (Size) {
     // If it is not contained and Size > 0 we should create a new entry for it.
     IsNew = true;
-    uintptr_t tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+    uintptr_t tp;
+    if (IsBulkEnabled) {
+      // return value is meaningless
+      tp = (uintptr_t)HstPtrBegin;
+      bulk_data_alloc(HstPtrBegin, Size);
+    } else {
+      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+    }
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
@@ -253,10 +222,6 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
 void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
     bool UpdateRefCount) {
   void *rc = NULL;
-  if (IsBulkEnabled) {
-    void *rc = bulkLookupMapping(HstPtrBegin, Size);
-    return rc;
-  }
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
 
@@ -286,10 +251,6 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
 // Lock-free version called when loading global symbols from the fat binary.
 void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
   uintptr_t hp = (uintptr_t)HstPtrBegin;
-  if (IsBulkEnabled) {
-    void *rc = bulkLookupMapping(HstPtrBegin, Size);
-    return rc;
-  }
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
   if (lr.Flags.IsContained || lr.Flags.ExtendsBefore || lr.Flags.ExtendsAfter) {
     auto &HT = *lr.Entry;
@@ -390,15 +351,27 @@ int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
 }
 
 // Add pointer update to suspend list.
-int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, void *OldHstPtrBase, void* NewHstPtrBase) {
-  UpdatePtrTy upl = {HstPtrBaseAddr, HstPtrValue, OldHstPtrBase, NewHstPtrBase};
-  UpdatePtrList.push(upl);
-  return 0;
+int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase) {
+
+  // Check redundant and if duplicated
+  for (auto i: UpdatePtrList) {
+    if (i.PtrBaseAddr == HstPtrBaseAddr) {
+      if (i.PtrValue != HstPtrValue) {
+        DP2("pointer update is not consist, " DPxMOD "-> " DPxMOD "vs " DPxMOD "\n", DPxPTR(HstPtrBaseAddr), DPxPTR(HstPtrValue), DPxPTR(i.PtrValue));
+      }
+      DP2("Skip suspend\n");
+      return OFFLOAD_SUCCESS;
+    }
+  }
+  DP2("Suspend update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
+      DPxPTR(HstPtrBaseAddr), DPxPTR(HstPtrValue));
+  UpdatePtrTy upl = {HstPtrBaseAddr, HstPtrValue, Delta, HstPtrBase};
+  UpdatePtrList.push_back(upl);
+  return OFFLOAD_SUCCESS;
 }
 
-// Update the suspend list
+// Update the suspend ptr update list
 int32_t DeviceTy::update_suspend_list() {
-  PFs();
   int32_t ret;
 
   //struct UpdatePtrTy upt;
@@ -406,42 +379,46 @@ int32_t DeviceTy::update_suspend_list() {
   //DP2("Start update_suspend_list \n");
   while (!UpdatePtrList.empty()) {
     struct UpdatePtrTy &upt = UpdatePtrList.front();
-    void *PtrBaseAddr = bulkLookupMapping(upt.PtrBaseAddr,sizeof(void*));
-    //uintptr_t Delta = (intptr_t)upt.PtrValue - (intptr_t)upt.PtrBaseAddr;
-    void *PtrValue = (void*)((uintptr_t)bulkLookupMapping(upt.PtrValue,sizeof(void*)));
-    //DP2("Delta: %ld\n", Delta);
-    DP2("Update pointer (" DPxMOD ") <- [" DPxMOD "]\n",
-                  DPxPTR(PtrBaseAddr), DPxPTR(PtrValue));
+    void *PtrBaseAddr, *PtrValue, *PtrValueBegin;
+    PtrBaseAddr = bulkGetTgtPtrBegin(upt.PtrBaseAddr,sizeof(void*));
+    PtrValueBegin = bulkGetTgtPtrBegin(upt.PtrValue,sizeof(void*));
+    PtrValue = (void*)((uintptr_t)PtrValueBegin - upt.Delta);
+    DP2("Update target pointer:" DPxMOD " to val:" DPxMOD "\n", DPxPTR(PtrBaseAddr), DPxPTR(PtrValue));
     ret = data_submit(PtrBaseAddr,  &PtrValue, sizeof(void*));
     if (ret) {
-      DP2("update_suspend_list failed");
+      DP2("update_suspend_list failed\n");
       return ret;
     }
     ShadowMtx.lock();
-    //ShadowPtrMap[upt.PtrAddr] = {upt.PtrValue, PtrValue, PtrBaseAddr};
-    //ShadowPtrMap[upt.PtrValue] = {upt.PtrAddr, PtrValue, PtrBaseAddr};
-    //           old ptr base  new ptr base
-    ShadowPtrMap[upt.OldHstPtrBase] = {upt.NewHstPtrBase, PtrBaseAddr,PtrValue};
+    ShadowPtrMap[upt.PtrBaseAddr] = {upt.HstPtrBase, PtrBaseAddr,PtrValue};
     ShadowMtx.unlock();
 
-    UpdatePtrList.pop();
+    UpdatePtrList.pop_front();
     ++i;
   }
   return 0;
 }
 
-int32_t DeviceTy::dump_regions() {
-  DP2("--- Dump RegionList -----------\n");
-  DP2("|\tSize :%lu\n", RegionList.size());
-  auto it = RegionList.begin();
-  while (it != RegionList.end()) {
+int32_t DeviceTy::dump_segmentlist() {
+  DP2("--- Dump SegmentList -----------\n");
+  DP2("|\tSize :%lu\n", SegmentList.size());
+  auto it = SegmentList.begin();
+  while (it != SegmentList.end()) {
     DP2("|%s\n", it->second.getString().c_str());
     it++;
-    // Add size?
-    //DP2("|[%p:%p] Size:%lu Tgt:%p\n", HstBegin, HstEnd, Size, (void*)it->second.TgtPtrBegin);
   }
   DP2("-------------------------------\n");
   return 0;
+}
+
+int32_t DeviceTy::dump_map() {
+  DP2("--- Dump HostDataToTargetMap -----------\n");
+  for (auto entry: HostDataToTargetMap) {
+    DP2("|[" DPxMOD "-" DPxMOD "],Ref: %ld]\n", DPxPTR(entry.HstPtrBegin), DPxPTR(entry.HstPtrEnd),entry.RefCount);
+  }
+  DP2("-------------------------------\n");
+  return 0;
+
 }
 
 
@@ -462,149 +439,210 @@ int32_t DeviceTy::run_team_region(void *TgtEntryPtr, void **TgtVarsPtr,
 
 // bulk transfer depends on Transfer type
 int32_t DeviceTy::bulk_transfer() {
-  auto it = RegionList.begin();
-  void *TgtPtrBegin;
-  while (it != RegionList.end()) {
-    size_t size = it->second.HstPtrEnd - it->second.HstPtrBegin;
+  auto it = SegmentList.begin();
 
-    if (Transfer == TransferFrom) {
-      // Must be searched
-      // Trans
-      void *TgtPtrBegin = bulkLookupMapping((void*)it->second.HstPtrBegin, size);
-      if (TgtPtrBegin) {
-        data_retrieve((void*)it->second.HstPtrBegin, TgtPtrBegin, size);
+  while (it != SegmentList.end()) {
+    size_t size = it->second.HstPtrEnd - it->second.HstPtrBegin;
+    if (!it->second.TgtPtrBegin) {
+      DP2("Alloc and copy region " DPxMOD "\n", DPxPTR(it->second.HstPtrBegin));
+      void *TgtPtrBegin = RTL->data_alloc(RTLDeviceID, size, NULL);
+      if (!TgtPtrBegin) {
+        DP("Failed to alloc data\n");
+        return OFFLOAD_FAIL;
       }
-    } else if (Transfer == TransferTo) {
-      bool IsNew = false;
-      if (!it->second.TgtPtrBegin) {
-        IsNew = true;
-			  TgtPtrBegin = RTL->data_alloc(RTLDeviceID, size, NULL);
-    	  it->second.TgtPtrBegin = (intptr_t)TgtPtrBegin;
-        it->second.bias = (intptr_t)TgtPtrBegin - (intptr_t) it->second.HstPtrBegin;
-      }
+      it->second.TgtPtrBegin = (intptr_t)TgtPtrBegin;
       data_submit(TgtPtrBegin,(void*)it->second.HstPtrBegin,size);
-    } else {
-      DP2("Error unrecognized transfer type \n");
     }
     it++;
   }
+  DP2("Bulk Transfered\n");
   return OFFLOAD_SUCCESS;
 }
 
 int32_t DeviceTy::bulk_map_from( void *HstPtrBegin, size_t Size) {
-  /*
-  if (Transfer != TransferFrom) {
-    RegionList.clear();
-    DP2("Device clean regions\n");
-    Transfer = TransferFrom;
-  }
-  return bulk_add(HstPtrBegin, Size);
-  */
-  void *TgtPtrBegin = bulkLookupMapping(HstPtrBegin, Size);
+  void *TgtPtrBegin = bulkGetTgtPtrBegin(HstPtrBegin, Size);
   if (TgtPtrBegin) {
     data_retrieve(HstPtrBegin, TgtPtrBegin, Size);
-    /*
-    if (Size == 4) {
-      DP2("Retrieve %p val: %d\n", HstPtrBegin, *(int*)HstPtrBegin);
-    }
-    */
     return OFFLOAD_SUCCESS;
   }
   return OFFLOAD_FAIL;
 }
 
-int32_t DeviceTy::bulk_map_to( void *HstPtrBegin, size_t Size) {
-  if (Transfer != TransferTo) {
-    RegionList.clear();
-    Transfer = TransferTo;
+// TODO multithreading support??
+// suspend the copy
+int32_t DeviceTy::bulk_data_submit(void *HstPtrBegin, int64_t Size) {
+  // TODO Raise error if paritally overlapped with mapped segment
+  BulkLookupResult r = bulkLookupMapping(HstPtrBegin, Size);
+  void *TgtPtrBegin = (void*)r.Entry->second.TgtPtrBegin;
+  // Direct copy if the segment has been mapped
+  if (TgtPtrBegin) {
+    data_submit(TgtPtrBegin, HstPtrBegin, Size);
   }
-  return bulk_add(HstPtrBegin, Size);
+  return OFFLOAD_SUCCESS;
 }
 
-void *DeviceTy::table_transfer(std::vector <RegionTy>table) {
-  int table_size = table.size() * sizeof(RegionTy);
+void *DeviceTy::table_transfer(std::vector <SegmentTy>table) {
+  int table_size = table.size() * sizeof(SegmentTy);
+  // TODO alloc only one time
   void *tgt_table = RTL->data_alloc(RTLDeviceID, table_size, NULL);
   data_submit(tgt_table, &table[0],table_size);
   return tgt_table;
 }
 
-int32_t DeviceTy::bulk_add(void *HstPtrBegin, size_t Size) {
-  //intptr_t threshold = 1000;
+// Add region, alloc later
+// Transfer right new if overlapped
+// suspend if region found and wait for bulk transfer
+int32_t DeviceTy::bulk_data_alloc(void *HstPtrBegin, size_t Size) {
+  if (!Size) {
+    return OFFLOAD_FAIL;
+  }
   intptr_t threshold = getpagesize();
-  // NOTE we use signed int to compute ptr
   intptr_t HstPtrBeginNew = (intptr_t) HstPtrBegin;
   intptr_t HstPtrEndNew = (intptr_t) HstPtrBegin + Size;
   intptr_t HstPtrBeginCur, HstPtrEndCur;
+  intptr_t TgtPtrBegin = 0;
   
-  auto it = RegionList.lower_bound((intptr_t)HstPtrBegin);
-  // HstPtrBegin <= it
+  auto it = SegmentList.lower_bound((intptr_t)HstPtrBegin);
 
-  //Merge
-  bool extend_high = false;
-  bool extend_low = false;
+  // Try merge
+  bool TryExtendHigh = false;
 
   // FIXME contain is not correct
-  bool contain = false;
+  bool Found = false;
 
-  // Region list  <-- back--   ++forward--->
+  // Segment list  <-- back--   ++forward--->
   //              High addr ---------- Low addr
+  //              | seg1| ^ |seg2|
+  //                 addr |   .lower_bound = seg2
   // Check forward
-  if (it != RegionList.end()) {
+  if (it != SegmentList.end()) {
     HstPtrBeginCur = (intptr_t) it->second.HstPtrBegin;
     HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
+
+    // Alloced segment cannot be extended
+    if (it->second.TgtPtrBegin) {
+      // Check overlap
+      if (HstPtrBeginNew < HstPtrEndCur) {
+        DP2("Overlap with alloced segment %s is not allowed for %p\n",
+            it->second.getString().c_str(), (void*)HstPtrBeginNew);
+        return OFFLOAD_FAIL;
+      }
+      goto BACKWARD;
+    }
     if (HstPtrBeginNew - HstPtrEndCur < threshold) {
-      contain = true;
+      Found = true;
       HstPtrBeginNew = HstPtrBeginCur;
       if (HstPtrEndNew > HstPtrEndCur) {
-        extend_high = true;
+        TryExtendHigh = true;
       } else {
         HstPtrEndNew = HstPtrEndCur;
       }
     } 
   }
+BACKWARD:
   // Check backward, higher addr
-  if (!contain && it != RegionList.begin()) {
+  if (!Found && it != SegmentList.begin()) {
     it--;
     HstPtrBeginCur = (intptr_t)  it->second.HstPtrBegin;
     HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
+    // Alloced segment cannot be extended
+    if (it->second.TgtPtrBegin) {
+      // Check overlap
+      if (HstPtrBeginCur > HstPtrEndNew) {
+        DP2("Overlap with alloced segment %s is not allowed for %p\n",
+            it->second.getString().c_str(), (void*)HstPtrBeginNew);
+        return OFFLOAD_FAIL;
+      }
+      goto NEW;
+    }
     if (HstPtrBeginCur - HstPtrEndNew < threshold) {
-      contain  = true;
-      // FIXME next line is useless?
-      //HstPtrBeginNew = HstPtrBeginCur < HstPtrEndNew ? HstPtrEndCur : HstPtrEndNew;
+      Found = true;
       if (HstPtrEndNew > HstPtrEndCur) {
-        extend_high = true;
+        TryExtendHigh = true;
       } else {
         HstPtrEndNew = HstPtrEndCur;
       }
     }
   }
 
-  auto cur = it;
-  if (extend_high) {
-    while (cur != RegionList.begin()) {
+  if (TryExtendHigh) {
+    auto cur = it;
+    while (cur != SegmentList.begin()) {
       cur --;
+      if (!cur->second.TgtPtrBegin) {
+        break;
+      }
       if ((intptr_t) cur->second.HstPtrEnd - HstPtrBeginNew < threshold) {
         HstPtrBeginCur = (intptr_t) cur->second.HstPtrBegin;
         HstPtrBeginNew = HstPtrBeginCur > HstPtrBeginNew ? HstPtrBeginNew : HstPtrBeginCur;
         DP2("Merged %s\n", (void*)cur->second.getString().c_str());
         // Remove region
-        RegionList.erase(cur--);
+        SegmentList.erase(cur--);
       }
     }
   }
-  if (contain) {
-    RegionList.erase(it);
+  if (Found) {
+    SegmentList.erase(it);
   }
-  RegionTy r;
-  r.HstPtrBegin = (intptr_t) HstPtrBeginNew;
-  r.HstPtrEnd = (intptr_t) HstPtrEndNew;
-  RegionList[(intptr_t) HstPtrBeginNew] = r;
-  if (contain) {
-    DP2("Added [%p,%p] to region: %s, extend_high: %d\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, r.getString().c_str(), extend_high);
+NEW:
+  // New segment for not alloced
+  SegmentTy r;
+  r.HstPtrBegin = HstPtrBeginNew;
+  r.HstPtrEnd = HstPtrEndNew;
+  r.TgtPtrBegin = 0;
+  SegmentList[(intptr_t) HstPtrBeginNew] = r;
+  if (Found) {
+    DP2("Added [%p,%p] to segment: %s, TryExtenHigh: %d\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, r.getString().c_str(), TryExtendHigh);
   } else {
-    DP2("New region [%p,%p]\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size);
+    DP2("New segment [%p,%p]\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size);
   }
-  return contain;
+  return OFFLOAD_SUCCESS;
+}
+
+void *DeviceTy::bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
+  void *ret;
+  BulkLookupResult r = bulkLookupMapping(HstPtrBegin, Size);
+  auto entry = r.Entry;
+  uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)entry->second.HstPtrBegin;
+  ret = (void*)(entry->second.TgtPtrBegin + Delta);
+  if (!ret) {
+    dump_segmentlist();
+    DP2("Lookup " DPxMOD "fail\n", DPxPTR(HstPtrBegin));
+  }
+  //DP2("Lookup " DPxMOD " get " DPxMOD "\n", DPxPTR(HstPtrBegin), DPxPTR(ret));
+  return ret;
+}
+
+BulkLookupResult DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
+  BulkLookupResult r;
+  void *TgtPtrBegin = NULL;
+  if (IsBulkEnabled) {
+    DP("(BULK) Looking up mapping(HstPtrBegin=" DPxMOD ", Size=%ld)...\n",
+       DPxPTR(HstPtrBegin), Size);
+    // FIXME  lower latency
+    // FIXME Add extend check
+    auto entry = SegmentList.lower_bound((intptr_t)HstPtrBegin);
+    bool IsContained = false;
+    bool ExtendsBefore = false;
+    bool ExtendsAfter = false;
+    if (entry != SegmentList.end()) {
+    //    DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
+      if ((intptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
+        if ((intptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
+          IsContained = true;
+          r.Entry = entry;
+        } else {
+          ExtendsAfter  = true;
+        }
+      } else if (entry != SegmentList.begin()) {
+        // check higher
+        if ((intptr_t) HstPtrBegin + Size < (--entry)->second.HstPtrEnd) {
+          ExtendsBefore = true;
+        }
+      }
+    }
+  }
+  return r;
 }
 
 /// Check whether a device has an associated RTL and initialize it if it's not

@@ -3,11 +3,11 @@
 #include "device.h"
 #include "private.h"
 
-void RegionTy::dump() {
+void SegmentTy::dump() {
   DP2("%s\n", getString().c_str());
 }
 
-std::string RegionTy::getString() {
+std::string SegmentTy::getString() {
   std::ostringstream str;
   str << "[" << (void*)HstPtrBegin << ":" << (void*) HstPtrEnd;
   if (TgtPtrBegin) {

@@ -85,28 +85,36 @@ typedef std::map<__tgt_bin_desc *, PendingCtorDtorListsTy>
 struct UpdatePtrTy {
   void *PtrBaseAddr;
   void *PtrValue;
-  void *OldHstPtrBase;
-  void *NewHstPtrBase;
+  uint64_t Delta;
+  void *HstPtrBase;
 };
 
-typedef std::queue<UpdatePtrTy> UpdatePtrListTy;
+typedef std::list<UpdatePtrTy> UpdatePtrListTy;
 
-struct RegionTy {
-  RegionTy() {
-    TgtPtrBegin = 0;
-  }
+struct SegmentTy {
+  // Function for debug
   void dump();
   std::string getString();
 
   uintptr_t HstPtrBegin;
   uintptr_t HstPtrEnd;
   uintptr_t TgtPtrBegin;
-  intptr_t bias;
-
 };
 
-// Better for lookup
-typedef std::map<uintptr_t, RegionTy, std::greater<uintptr_t>> RegionListTy;
+// std::map is better for lookup
+typedef std::map<uintptr_t, SegmentTy, std::greater<uintptr_t>> SegmentListTy;
+
+struct BulkLookupResult {
+  struct {
+    unsigned IsContained   : 1;
+    unsigned ExtendsBefore : 1;
+    unsigned ExtendsAfter  : 1;
+  } Flags;
+
+  SegmentListTy::iterator Entry;
+
+  BulkLookupResult() : Flags({0,0,0}), Entry() {};
+};
 
 struct DeviceTy {
   int32_t DeviceID;
@@ -187,27 +195,24 @@ struct DeviceTy {
 
   // pschen custom
   UpdatePtrListTy UpdatePtrList;
-  RegionListTy RegionList;
+  SegmentListTy SegmentList;
 
   bool IsBulkEnabled;
   bool IsATEnabled;
-  enum TransferType {
-    TransferNone,
-    TransferTo,
-    TransferFrom
-  };
-  enum TransferType Transfer = TransferNone;
-  int32_t suspend_update(void *TgtPtrAddr, void *TgtPtrValue, void* OldBase, void*NewBase);
+  int32_t suspend_update(void *HstPtrAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase);
   int32_t update_suspend_list();
-  int32_t dump_regions();
+  int32_t dump_segmentlist();
+  int32_t dump_map();
 
   // bulk related
-  int32_t bulk_map_to(void *HstPtrBegin, size_t size);
   int32_t bulk_map_from(void *HstPtrBegin, size_t size);
-  int32_t bulk_add(void *HstPtrBegin, size_t size);
+  int32_t bulk_data_alloc(void *HstPtrBegin, size_t size);
+  int32_t bulk_data_submit(void *HstPtrBegin, int64_t Size);
   int32_t bulk_transfer();
-  void *table_transfer(std::vector<RegionTy> table);
-  void *bulkLookupMapping(void *HstPtrBegin, int64_t Size);
+  void *table_transfer(std::vector<SegmentTy> table);
+
+  BulkLookupResult bulkLookupMapping(void *HstPtrBegin, int64_t Size);
+  void *bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size);
 private:
   // Call to RTL
   void init(); // To be called only via DeviceTy::initOnce()

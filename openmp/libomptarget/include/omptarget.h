@@ -21,7 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+
+#undef NDEBUG
 #define DP2(...) if(getenv("DP2"))  printf("[omp-dc] " __VA_ARGS__)
+#define DP3(...) if(getenv("DP3"))  printf("[omp-dc] " __VA_ARGS__)
 
 // Debug function
 #define PFs() DP2("Function %s start\n", __func__)

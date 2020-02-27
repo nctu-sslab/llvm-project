@@ -4,6 +4,9 @@
 
 #include <omptarget.h>
 
+#include "device.h"
+#include "private.h"
+
 typedef struct AddressTranslate {
 
   intptr_t fake_table_size;

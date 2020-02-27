@@ -38,7 +38,7 @@ struct HostDataToTargetTy {
 
   uintptr_t TgtPtrBegin; // target info.
 
-  long RefCount; 
+  long RefCount;
   HostDataToTargetTy()
       : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0),
         TgtPtrBegin(0), RefCount(0) {}
@@ -89,7 +89,10 @@ struct UpdatePtrTy {
   void *HstPtrBase;
 };
 
-typedef std::list<UpdatePtrTy> UpdatePtrListTy;
+// Use List if we wanted to skip redundant update
+// But the lookup time getting bigger as list bigger
+//typedef std::list<UpdatePtrTy> UpdatePtrListTy;
+typedef std::queue<UpdatePtrTy> UpdatePtrListTy;
 
 struct SegmentTy {
   // Function for debug
@@ -99,6 +102,7 @@ struct SegmentTy {
   uintptr_t HstPtrBegin;
   uintptr_t HstPtrEnd;
   uintptr_t TgtPtrBegin;
+  intptr_t bias;
 };
 
 // std::map is better for lookup

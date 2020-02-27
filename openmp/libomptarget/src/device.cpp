@@ -199,7 +199,10 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     if (IsBulkEnabled) {
       // return value is meaningless
       tp = (uintptr_t)HstPtrBegin;
-      bulk_data_alloc(HstPtrBegin, Size);
+      int32_t ret = bulk_data_alloc(HstPtrBegin, Size);
+      if (ret) {
+        tp = 0;
+      }
     } else {
       tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     }
@@ -299,13 +302,15 @@ void DeviceTy::init() {
   int32_t rc = RTL->init_device(RTLDeviceID);
   if (rc == OFFLOAD_SUCCESS) {
     if (getenv("OMP_AT")) {
-      DP2("Address Translate Enabled\n");
+      //DP2("Address Translate Enabled\n");
+      fprintf(stderr, "[omp-dc] Address Translate Enabled\n");
       IsATEnabled = true;
     } else {
       IsATEnabled = false;
     }
     if (getenv("OMP_BULK") || IsATEnabled) {
-      DP2("Bulk Transfer Enabled\n");
+      //DP2("Bulk Transfer Enabled\n");
+      fprintf(stderr, "[omp-dc] Bulk Transfer Enabled\n");
       IsBulkEnabled = true;
     } else {
       IsBulkEnabled = false;
@@ -354,19 +359,21 @@ int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
 int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase) {
 
   // Check redundant and if duplicated
-  for (auto i: UpdatePtrList) {
+  /*for (auto i: UpdatePtrList) {
+    uintptr_t OldPtrVal = (uintptr_t) i.PtrValue - i.Delta;
+    uintptr_t NewPtrVal = (uintptr_t) HstPtrValue - Delta;
     if (i.PtrBaseAddr == HstPtrBaseAddr) {
-      if (i.PtrValue != HstPtrValue) {
-        DP2("pointer update is not consist, " DPxMOD "-> " DPxMOD "vs " DPxMOD "\n", DPxPTR(HstPtrBaseAddr), DPxPTR(HstPtrValue), DPxPTR(i.PtrValue));
+      if (OldPtrVal != NewPtrVal) {
+        fprintf(stderr, "Pointer update is not consist, " DPxMOD "-> " DPxMOD " vs " DPxMOD "\n", DPxPTR(HstPtrBaseAddr), DPxPTR(OldPtrVal), DPxPTR(NewPtrVal));
       }
       DP2("Skip suspend\n");
       return OFFLOAD_SUCCESS;
     }
-  }
+  }*/
   DP2("Suspend update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
       DPxPTR(HstPtrBaseAddr), DPxPTR(HstPtrValue));
   UpdatePtrTy upl = {HstPtrBaseAddr, HstPtrValue, Delta, HstPtrBase};
-  UpdatePtrList.push_back(upl);
+  UpdatePtrList.push(upl);
   return OFFLOAD_SUCCESS;
 }
 
@@ -374,9 +381,7 @@ int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, uint64
 int32_t DeviceTy::update_suspend_list() {
   int32_t ret;
 
-  //struct UpdatePtrTy upt;
   int i = 0;
-  //DP2("Start update_suspend_list \n");
   while (!UpdatePtrList.empty()) {
     struct UpdatePtrTy &upt = UpdatePtrList.front();
     void *PtrBaseAddr, *PtrValue, *PtrValueBegin;
@@ -386,14 +391,15 @@ int32_t DeviceTy::update_suspend_list() {
     DP2("Update target pointer:" DPxMOD " to val:" DPxMOD "\n", DPxPTR(PtrBaseAddr), DPxPTR(PtrValue));
     ret = data_submit(PtrBaseAddr,  &PtrValue, sizeof(void*));
     if (ret) {
-      DP2("update_suspend_list failed\n");
+      DP2("Update_suspend_list failed\n");
       return ret;
     }
     ShadowMtx.lock();
     ShadowPtrMap[upt.PtrBaseAddr] = {upt.HstPtrBase, PtrBaseAddr,PtrValue};
     ShadowMtx.unlock();
 
-    UpdatePtrList.pop_front();
+    //UpdatePtrList.pop_front();
+    UpdatePtrList.pop();
     ++i;
   }
   return 0;
@@ -444,7 +450,7 @@ int32_t DeviceTy::bulk_transfer() {
   while (it != SegmentList.end()) {
     size_t size = it->second.HstPtrEnd - it->second.HstPtrBegin;
     if (!it->second.TgtPtrBegin) {
-      DP2("Alloc and copy region " DPxMOD "\n", DPxPTR(it->second.HstPtrBegin));
+      DP2("Alloc and copy segment " DPxMOD "\n", DPxPTR(it->second.HstPtrBegin));
       void *TgtPtrBegin = RTL->data_alloc(RTLDeviceID, size, NULL);
       if (!TgtPtrBegin) {
         DP("Failed to alloc data\n");
@@ -472,16 +478,20 @@ int32_t DeviceTy::bulk_map_from( void *HstPtrBegin, size_t Size) {
 // suspend the copy
 int32_t DeviceTy::bulk_data_submit(void *HstPtrBegin, int64_t Size) {
   // TODO Raise error if paritally overlapped with mapped segment
-  BulkLookupResult r = bulkLookupMapping(HstPtrBegin, Size);
-  void *TgtPtrBegin = (void*)r.Entry->second.TgtPtrBegin;
+  void *TgtPtrBegin = bulkGetTgtPtrBegin(HstPtrBegin, Size);
   // Direct copy if the segment has been mapped
   if (TgtPtrBegin) {
+    DP2("Direct submit %d -> %p\n", *(int*)HstPtrBegin, TgtPtrBegin);
     data_submit(TgtPtrBegin, HstPtrBegin, Size);
   }
   return OFFLOAD_SUCCESS;
 }
 
 void *DeviceTy::table_transfer(std::vector <SegmentTy>table) {
+  // Compute bias
+  for (auto &i : table) {
+    i.bias = (intptr_t)i.TgtPtrBegin - (intptr_t)i.HstPtrBegin;
+  }
   int table_size = table.size() * sizeof(SegmentTy);
   // TODO alloc only one time
   void *tgt_table = RTL->data_alloc(RTLDeviceID, table_size, NULL);
@@ -489,9 +499,9 @@ void *DeviceTy::table_transfer(std::vector <SegmentTy>table) {
   return tgt_table;
 }
 
-// Add region, alloc later
+// Add segment, alloc later
 // Transfer right new if overlapped
-// suspend if region found and wait for bulk transfer
+// suspend if segment found and wait for bulk transfer
 int32_t DeviceTy::bulk_data_alloc(void *HstPtrBegin, size_t Size) {
   if (!Size) {
     return OFFLOAD_FAIL;
@@ -501,89 +511,117 @@ int32_t DeviceTy::bulk_data_alloc(void *HstPtrBegin, size_t Size) {
   intptr_t HstPtrEndNew = (intptr_t) HstPtrBegin + Size;
   intptr_t HstPtrBeginCur, HstPtrEndCur;
   intptr_t TgtPtrBegin = 0;
-  
+
   auto it = SegmentList.lower_bound((intptr_t)HstPtrBegin);
 
   // Try merge
   bool TryExtendHigh = false;
 
-  // FIXME contain is not correct
   bool Found = false;
+  bool ContainedInOld = false;
+
+  std::vector<SegmentListTy::iterator> EraseSegs;
 
   // Segment list  <-- back--   ++forward--->
   //              High addr ---------- Low addr
   //              | seg1| ^ |seg2|
   //                 addr |   .lower_bound = seg2
   // Check forward
+  // TODO No new if it's alloced
   if (it != SegmentList.end()) {
     HstPtrBeginCur = (intptr_t) it->second.HstPtrBegin;
     HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
 
-    // Alloced segment cannot be extended
-    if (it->second.TgtPtrBegin) {
-      // Check overlap
-      if (HstPtrBeginNew < HstPtrEndCur) {
-        DP2("Overlap with alloced segment %s is not allowed for %p\n",
-            it->second.getString().c_str(), (void*)HstPtrBeginNew);
-        return OFFLOAD_FAIL;
-      }
-      goto BACKWARD;
-    }
     if (HstPtrBeginNew - HstPtrEndCur < threshold) {
-      Found = true;
-      HstPtrBeginNew = HstPtrBeginCur;
+      // Exceed segment cur end
       if (HstPtrEndNew > HstPtrEndCur) {
+        // Alloced segment cannot be extended
+        if (it->second.TgtPtrBegin) {
+
+          // Check overlap
+          if (HstPtrBeginNew < HstPtrEndCur) {
+            DP2("Overlap with alloced segment %s is not allowed for %p, size %zu\n",
+                it->second.getString().c_str(), (void*)HstPtrBegin, Size);
+            return OFFLOAD_FAIL;
+          }
+          // No overlap with cur, try next.
+          goto BACKWARD;
+        }
         TryExtendHigh = true;
       } else {
         HstPtrEndNew = HstPtrEndCur;
+        ContainedInOld = true;
+        if (it->second.TgtPtrBegin) {
+          DP2("Contained in %s, return\n", it->second.getString().c_str());
+          return OFFLOAD_SUCCESS;
+        }
       }
-    } 
+      HstPtrBeginNew = HstPtrBeginCur;
+      if (!it->second.TgtPtrBegin) {
+        Found = true;
+        EraseSegs.push_back(it);
+      } else {
+        DP2("Contained in %s, return\n", it->second.getString().c_str());
+        return OFFLOAD_SUCCESS;
+      }
+    }
+  } else {
+    goto NEW;
   }
 BACKWARD:
+  // FIXME always extendhigh??
   // Check backward, higher addr
-  if (!Found && it != SegmentList.begin()) {
+  while (it != SegmentList.begin() && (!Found || TryExtendHigh || ContainedInOld)) {
     it--;
     HstPtrBeginCur = (intptr_t)  it->second.HstPtrBegin;
     HstPtrEndCur = (intptr_t) it->second.HstPtrEnd;
-    // Alloced segment cannot be extended
-    if (it->second.TgtPtrBegin) {
-      // Check overlap
-      if (HstPtrBeginCur > HstPtrEndNew) {
-        DP2("Overlap with alloced segment %s is not allowed for %p\n",
-            it->second.getString().c_str(), (void*)HstPtrBeginNew);
-        return OFFLOAD_FAIL;
+
+    intptr_t gap = HstPtrBeginCur - HstPtrEndNew;
+
+    if (gap < threshold) {
+      if (it->second.TgtPtrBegin) {
+        if (gap < 0) {
+        // check overlap with alloced segment
+          DP2("Overlap with alloced segment %s is not allowed for %p, size %zu\n",
+              it->second.getString().c_str(), (void*)HstPtrBegin, Size);
+          return OFFLOAD_FAIL;
+        } else {
+          break;
+        }
       }
-      goto NEW;
-    }
-    if (HstPtrBeginCur - HstPtrEndNew < threshold) {
-      Found = true;
+      DP2("Merged %s\n", it->second.getString().c_str());
+      // Exceed the end
       if (HstPtrEndNew > HstPtrEndCur) {
         TryExtendHigh = true;
       } else {
         HstPtrEndNew = HstPtrEndCur;
+        TryExtendHigh = false;
       }
+      Found = true;
+      // Erase segment
+      EraseSegs.push_back(it);
+    } else {
+      break;
     }
+  }
+CHECK:
+  // TODO remove check
+  /*
+  if (ContainedInOld && it->second.TgtPtrBegin) {
+    DP2("Alloc segment: [%p:%p] has been in segment: %s\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, it->second.getString().c_str());
+    if (EraseSegs.size() != 0) {
+      DP2("Found? %d\n", Found);
+      for (auto seg : EraseSegs) {
+        seg->second.dump();
+      }
+      assert("ContainedInOld segment should not erase others" && 0);
+    }
+    return OFFLOAD_SUCCESS;
+  }*/
+  for (auto seg : EraseSegs) {
+    SegmentList.erase(seg);
   }
 
-  if (TryExtendHigh) {
-    auto cur = it;
-    while (cur != SegmentList.begin()) {
-      cur --;
-      if (!cur->second.TgtPtrBegin) {
-        break;
-      }
-      if ((intptr_t) cur->second.HstPtrEnd - HstPtrBeginNew < threshold) {
-        HstPtrBeginCur = (intptr_t) cur->second.HstPtrBegin;
-        HstPtrBeginNew = HstPtrBeginCur > HstPtrBeginNew ? HstPtrBeginNew : HstPtrBeginCur;
-        DP2("Merged %s\n", (void*)cur->second.getString().c_str());
-        // Remove region
-        SegmentList.erase(cur--);
-      }
-    }
-  }
-  if (Found) {
-    SegmentList.erase(it);
-  }
 NEW:
   // New segment for not alloced
   SegmentTy r;
@@ -592,7 +630,7 @@ NEW:
   r.TgtPtrBegin = 0;
   SegmentList[(intptr_t) HstPtrBeginNew] = r;
   if (Found) {
-    DP2("Added [%p,%p] to segment: %s, TryExtenHigh: %d\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, r.getString().c_str(), TryExtendHigh);
+    DP2("Added [%p,%p] to segment: %s\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size, r.getString().c_str());
   } else {
     DP2("New segment [%p,%p]\n", (void*)HstPtrBegin, (char*)HstPtrBegin + Size);
   }
@@ -603,12 +641,13 @@ void *DeviceTy::bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
   void *ret;
   BulkLookupResult r = bulkLookupMapping(HstPtrBegin, Size);
   auto entry = r.Entry;
+
+  if (!entry->second.TgtPtrBegin) {
+    return NULL;
+  }
+
   uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)entry->second.HstPtrBegin;
   ret = (void*)(entry->second.TgtPtrBegin + Delta);
-  if (!ret) {
-    dump_segmentlist();
-    DP2("Lookup " DPxMOD "fail\n", DPxPTR(HstPtrBegin));
-  }
   //DP2("Lookup " DPxMOD " get " DPxMOD "\n", DPxPTR(HstPtrBegin), DPxPTR(ret));
   return ret;
 }

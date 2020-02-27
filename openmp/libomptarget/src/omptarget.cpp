@@ -24,6 +24,7 @@
 
 #ifdef OMPTARGET_DEBUG
 int DebugLevel = 0;
+int DebugLevel2 = 0;
 #endif // OMPTARGET_DEBUG
 
 /* All begin addresses for partially mapped structs must be 8-aligned in order
@@ -353,7 +354,7 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       continue;
     }
 
-    //DP2("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBegin, HstPtrBase, data_size, arg_types[i]);
+    DP("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", args[i], args_base[i], arg_sizes[i], arg_types[i]);
 
     void *HstPtrBegin = args[i];
     void *HstPtrBase = args_base[i];
@@ -418,6 +419,7 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       // NULL, so getOrAlloc() returning NULL is not an error.
       DP2("Call to getOrAllocTgtPtr failed (device failure or "
           "illegal mapping).\n");
+      return OFFLOAD_FAIL;
     }
     DP2("There are %" PRId64 " bytes on target mapped with host address " DPxMOD
         " - is%s new\n", data_size, DPxPTR(HstPtrBegin),
@@ -451,13 +453,15 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
         DP("Suspend moving %" PRId64 " bytes (hst:" DPxMOD ")\n",
             data_size, DPxPTR(HstPtrBegin));
         //int rt = Device.data_submit(TgtPtrBegin, HstPtrBegin, data_size);
-        // FIXME alloc equal to copy for now
         int rt = Device.bulk_data_submit(HstPtrBegin, data_size);
         if (rt != OFFLOAD_SUCCESS) {
           DP("Copying data to device failed.\n");
           return OFFLOAD_FAIL;
         }
       }
+    }
+    if (Device.IsATEnabled) {
+      continue;
     }
 
     if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
@@ -566,6 +570,11 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
       // shadow pointer entries for this struct.
       uintptr_t lb = (uintptr_t) HstPtrBegin;
       uintptr_t ub = (uintptr_t) HstPtrBegin + data_size;
+
+      if (Device.IsATEnabled) {
+        goto DEL;
+      }
+
       Device.ShadowMtx.lock();
       for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
            it != Device.ShadowPtrMap.end();) {
@@ -597,6 +606,7 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
       }
       Device.ShadowMtx.unlock();
 
+DEL:
       // Deallocate map
       if (DelEntry) {
         int rt = Device.deallocTgtPtr(HstPtrBegin, data_size, ForceDelete);
@@ -775,7 +785,7 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   if (Device.IsBulkEnabled) {
     Device.bulk_transfer();
     Device.dump_segmentlist();
-    Device.dump_map();
+    //Device.dump_map();
 
     if (!Device.IsATEnabled) {
       Device.update_suspend_list(); // shadowlist
@@ -795,11 +805,12 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     AT.addTable(tgt_table);
     AT.addTableSize(table.size());
 
+    int fake_literal = 878787;
     int fake_table_size = 13;
     int fake_table_byte = fake_table_size * sizeof(struct SegmentTy);
     //DP2("Expected size: %d\n", fake_table_size);
     AT.addFakeByte(fake_table_byte);
-    AT.addFakeSize(fake_table_size);
+    AT.addFakeSize(fake_literal);
   }
 
   std::vector<void *> tgt_args;
@@ -917,10 +928,6 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       }
       TgtBaseOffset = (intptr_t)HstPtrBase - (intptr_t)HstPtrBegin;
 
-      // pschen
-      if (Device.IsATEnabled) {
-        TgtPtrBegin = AT.passArg(TgtPtrBegin, arg_sizes[i]);
-      }
 #ifdef OMPTARGET_DEBUG
       void *TgtPtrBase = (void *)((intptr_t)TgtPtrBegin + TgtBaseOffset);
       DP("Obtained target argument " DPxMOD " from host pointer " DPxMOD "\n",

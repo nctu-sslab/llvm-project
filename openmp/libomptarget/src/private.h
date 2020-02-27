@@ -75,6 +75,7 @@ int __kmpc_get_target_offload(void) __attribute__((weak));
 
 #ifdef OMPTARGET_DEBUG
 extern int DebugLevel;
+extern int DebugLevel2;
 
 #define DP(...) \
   do { \
@@ -82,6 +83,17 @@ extern int DebugLevel;
       DEBUGP("Libomptarget", __VA_ARGS__); \
     } \
   } while (false)
+
+#define DP2(...) \
+  do { \
+    if (DebugLevel2 > 0) { \
+      DEBUGP("omp-dc", __VA_ARGS__); \
+    } \
+  } while (false)
+
+#define PFs() DP2("Function %s start\n", __func__)
+#define PFe() DP2("Function %s end\n", __func__)
+
 #else // OMPTARGET_DEBUG
 #define DP(...) {}
 #endif // OMPTARGET_DEBUG

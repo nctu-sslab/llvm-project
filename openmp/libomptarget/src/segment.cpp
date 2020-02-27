@@ -1,5 +1,4 @@
-#include <sstream>
-
+#include <stdio.h>
 #include "device.h"
 #include "private.h"
 
@@ -8,11 +7,14 @@ void SegmentTy::dump() {
 }
 
 std::string SegmentTy::getString() {
-  std::ostringstream str;
-  str << "[" << (void*)HstPtrBegin << ":" << (void*) HstPtrEnd;
+  char buf[120];
+  uintptr_t size = HstPtrEnd - HstPtrBegin;
   if (TgtPtrBegin) {
-    str << "->" << (void*)TgtPtrBegin;
+    sprintf(buf, "[" DPxMOD ":" DPxMOD "->" DPxMOD "<%" PRIuPTR ">]",
+        DPxPTR(HstPtrBegin), DPxPTR(HstPtrEnd), DPxPTR(TgtPtrBegin), size);
+  } else {
+    sprintf(buf, "[" DPxMOD ":" DPxMOD "<%" PRIuPTR ">]",
+        DPxPTR(HstPtrBegin), DPxPTR(HstPtrEnd), size);
   }
-  str << "]";
-  return str.str();
+  return std::string(buf);
 }

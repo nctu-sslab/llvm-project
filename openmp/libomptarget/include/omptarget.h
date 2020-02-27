@@ -22,13 +22,9 @@
 #include <stdlib.h>
 #include <math.h>
 
+// TODO remove me when assert is not needed
 #undef NDEBUG
-#define DP2(...) if(getenv("DP2"))  printf("[omp-dc] " __VA_ARGS__)
-#define DP3(...) if(getenv("DP3"))  printf("[omp-dc] " __VA_ARGS__)
 
-// Debug function
-#define PFs() DP2("Function %s start\n", __func__)
-#define PFe() DP2("Function %s end\n", __func__)
 
 // Origin flags
 #define OMPTARGET_DEBUG

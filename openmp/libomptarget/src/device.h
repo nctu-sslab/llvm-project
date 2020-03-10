@@ -106,7 +106,15 @@ struct SegmentTy {
 };
 
 // std::map is better for lookup
-typedef std::map<uintptr_t, SegmentTy, std::greater<uintptr_t>> SegmentListTy;
+// Store device segment list too
+typedef std::map<uintptr_t, SegmentTy, std::greater<uintptr_t>> SegMap;
+struct SegmentListTy : public SegMap {
+  std::vector<SegmentTy> TgtList;
+  void *TgtMemPtr;
+  int TgtMemSize;
+
+  SegmentListTy() : TgtMemSize (0), TgtMemPtr (NULL) {}
+};
 
 struct BulkLookupResult {
   struct {
@@ -213,7 +221,7 @@ struct DeviceTy {
   int32_t bulk_data_alloc(void *HstPtrBegin, size_t size);
   int32_t bulk_data_submit(void *HstPtrBegin, int64_t Size);
   int32_t bulk_transfer();
-  void *table_transfer(std::vector<SegmentTy> table);
+  void table_transfer();
 
   BulkLookupResult bulkLookupMapping(void *HstPtrBegin, int64_t Size);
   void *bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size);

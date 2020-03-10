@@ -17,6 +17,8 @@
 #include "private.h"
 #include "rtl.h"
 
+#include "perf.h"
+
 #include <cassert>
 #include <cstdlib>
 #include <mutex>
@@ -83,6 +85,7 @@ EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
 ////////////////////////////////////////////////////////////////////////////////
 /// unloads a target shared library
 EXTERN void __tgt_unregister_lib(__tgt_bin_desc *desc) {
+  Perf.dump();
   RTLs.UnregisterLib(desc);
 }
 
@@ -107,6 +110,7 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
     HandleTargetOutcome(false);
     return;
   }
+  Perf.Runtime.start();
 
   DeviceTy& Device = Devices[device_id];
 
@@ -121,6 +125,7 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
   int rc = target_data_begin(Device, arg_num, args_base,
       args, arg_sizes, arg_types);
   HandleTargetOutcome(rc == OFFLOAD_SUCCESS);
+  Perf.Runtime.end();
 }
 
 EXTERN void __tgt_target_data_begin_nowait(int64_t device_id, int32_t arg_num,
@@ -163,6 +168,7 @@ EXTERN void __tgt_target_data_end(int64_t device_id, int32_t arg_num,
     return;
   }
 
+  Perf.Runtime.start();
 #ifdef OMPTARGET_DEBUG
   for (int i=0; i<arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
@@ -174,6 +180,7 @@ EXTERN void __tgt_target_data_end(int64_t device_id, int32_t arg_num,
   int rc = target_data_end(Device, arg_num, args_base,
       args, arg_sizes, arg_types);
   HandleTargetOutcome(rc == OFFLOAD_SUCCESS);
+  Perf.Runtime.end();
 }
 
 EXTERN void __tgt_target_data_end_nowait(int64_t device_id, int32_t arg_num,
@@ -236,6 +243,7 @@ EXTERN int __tgt_target(int64_t device_id, void *host_ptr, int32_t arg_num,
     return OFFLOAD_FAIL;
   }
 
+  Perf.Runtime.start();
 #ifdef OMPTARGET_DEBUG
   for (int i=0; i<arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
@@ -248,6 +256,7 @@ EXTERN int __tgt_target(int64_t device_id, void *host_ptr, int32_t arg_num,
       arg_types, 0, 0, false /*team*/);
   HandleTargetOutcome(rc == OFFLOAD_SUCCESS);
   return rc;
+  Perf.Runtime.end();
 }
 
 EXTERN int __tgt_target_nowait(int64_t device_id, void *host_ptr,
@@ -278,6 +287,7 @@ EXTERN int __tgt_target_teams(int64_t device_id, void *host_ptr,
     return OFFLOAD_FAIL;
   }
 
+  Perf.Runtime.start();
 #ifdef OMPTARGET_DEBUG
   for (int i=0; i<arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
@@ -290,6 +300,8 @@ EXTERN int __tgt_target_teams(int64_t device_id, void *host_ptr,
       arg_types, team_num, thread_limit, true /*team*/);
   HandleTargetOutcome(rc == OFFLOAD_SUCCESS);
 
+  Perf.Runtime.end();
+  Perf.TargetMem.get(device_id);
   return rc;
 }
 

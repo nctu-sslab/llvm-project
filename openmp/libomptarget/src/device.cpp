@@ -14,6 +14,8 @@
 #include "private.h"
 #include "rtl.h"
 
+#include "perf.h"
+
 #include <cassert>
 #include <climits>
 #include <string>
@@ -277,7 +279,9 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       assert(HT.RefCount == 0 && "did not expect a negative ref count");
       DP("Deleting tgt data " DPxMOD " of size %ld\n",
           DPxPTR(HT.TgtPtrBegin), Size);
-      RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      if (!IsBulkEnabled) {
+        RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
+      }
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
           ", Size=%ld\n", (ForceDelete ? " (forced)" : ""),
           DPxPTR(HT.HstPtrBegin), DPxPTR(HT.TgtPtrBegin), Size);
@@ -315,6 +319,7 @@ void DeviceTy::init() {
     } else {
       IsBulkEnabled = false;
     }
+    fprintf(stderr, "[omp-dc] Offloading Enabled\n");
     IsInit = true;
   }
 }
@@ -346,13 +351,19 @@ __tgt_target_table *DeviceTy::load_binary(void *Img) {
 // Submit data to device.
 int32_t DeviceTy::data_submit(void *TgtPtrBegin, void *HstPtrBegin,
     int64_t Size) {
-  return RTL->data_submit(RTLDeviceID, TgtPtrBegin, HstPtrBegin, Size);
+  Perf.H2DTransfer.start();
+  int32_t ret = RTL->data_submit(RTLDeviceID, TgtPtrBegin, HstPtrBegin, Size);
+  Perf.H2DTransfer.end();
+  return ret;
 }
 
 // Retrieve data from device.
 int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
     int64_t Size) {
-  return RTL->data_retrieve(RTLDeviceID, HstPtrBegin, TgtPtrBegin, Size);
+  Perf.D2HTransfer.start();
+  int32_t ret =  RTL->data_retrieve(RTLDeviceID, HstPtrBegin, TgtPtrBegin, Size);
+  Perf.D2HTransfer.end();
+  return ret;
 }
 
 // Add pointer update to suspend list.
@@ -383,6 +394,7 @@ int32_t DeviceTy::update_suspend_list() {
 
   int i = 0;
   while (!UpdatePtrList.empty()) {
+    Perf.UpdatePtr.start();
     struct UpdatePtrTy &upt = UpdatePtrList.front();
     void *PtrBaseAddr, *PtrValue, *PtrValueBegin;
     PtrBaseAddr = bulkGetTgtPtrBegin(upt.PtrBaseAddr,sizeof(void*));
@@ -401,6 +413,7 @@ int32_t DeviceTy::update_suspend_list() {
     //UpdatePtrList.pop_front();
     UpdatePtrList.pop();
     ++i;
+    Perf.UpdatePtr.end();
   }
   return 0;
 }
@@ -431,16 +444,22 @@ int32_t DeviceTy::dump_map() {
 // Run region on device
 int32_t DeviceTy::run_region(void *TgtEntryPtr, void **TgtVarsPtr,
     ptrdiff_t *TgtOffsets, int32_t TgtVarsSize) {
-  return RTL->run_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
+  Perf.Kernel.start();
+  int32_t ret = RTL->run_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
       TgtVarsSize);
+  Perf.Kernel.end();
+  return ret;
 }
 
 // Run team region on device.
 int32_t DeviceTy::run_team_region(void *TgtEntryPtr, void **TgtVarsPtr,
     ptrdiff_t *TgtOffsets, int32_t TgtVarsSize, int32_t NumTeams,
     int32_t ThreadLimit, uint64_t LoopTripCount) {
-  return RTL->run_team_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
+  Perf.Kernel.start();
+  int32_t ret = RTL->run_team_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
       TgtVarsSize, NumTeams, ThreadLimit, LoopTripCount);
+  Perf.Kernel.end();
+  return ret;
 }
 
 // bulk transfer depends on Transfer type
@@ -487,16 +506,35 @@ int32_t DeviceTy::bulk_data_submit(void *HstPtrBegin, int64_t Size) {
   return OFFLOAD_SUCCESS;
 }
 
-void *DeviceTy::table_transfer(std::vector <SegmentTy>table) {
-  // Compute bias
+void DeviceTy::table_transfer() {
+  // TODO Remove bias
+  /*// Compute bias
   for (auto &i : table) {
     i.bias = (intptr_t)i.TgtPtrBegin - (intptr_t)i.HstPtrBegin;
+  }*/
+  // TODO Only copy useful page
+  auto &table = SegmentList.TgtList;
+  table.clear();
+
+  // First segment stores the size
+  table.push_back(SegmentTy());
+  for (auto &it : SegmentList) {
+    table.push_back(it.second);
   }
   int table_size = table.size() * sizeof(SegmentTy);
-  // TODO alloc only one time
-  void *tgt_table = RTL->data_alloc(RTLDeviceID, table_size, NULL);
-  data_submit(tgt_table, &table[0],table_size);
-  return tgt_table;
+  table[0].HstPtrBegin = table_size;
+
+  // Size is bigger than before
+  if (SegmentList.TgtMemSize < table_size) {
+    int NewSize = table_size + 4 * sizeof(SegmentTy);
+    if (SegmentList.TgtMemPtr) {
+      RTL->data_delete(RTLDeviceID, SegmentList.TgtMemPtr);
+    }
+    SegmentList.TgtMemPtr = RTL->data_alloc(RTLDeviceID, NewSize, NULL);
+    SegmentList.TgtMemSize = NewSize;
+  }
+  data_submit(SegmentList.TgtMemPtr, &table[0],table_size);
+  DP2("Transfered AT table");
 }
 
 // Add segment, alloc later

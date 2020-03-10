@@ -20,6 +20,7 @@
 #include <cassert>
 #include <vector>
 
+#include "perf.h"
 #include "at.h"
 
 #ifdef OMPTARGET_DEBUG
@@ -318,6 +319,7 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
       }
     }
 
+    Perf.UpdatePtr.start();
     if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
           DPxPTR(Pointer_TgtPtrBegin), DPxPTR(TgtPtrBegin));
@@ -335,6 +337,7 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
           Pointer_TgtPtrBegin, TgtPtrBase};
       Device.ShadowMtx.unlock();
     }
+    Perf.UpdatePtr.end();
   }
 
   return OFFLOAD_SUCCESS;
@@ -794,16 +797,10 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
 
   if (Device.IsATEnabled) {
     // convert region list to table
-    std::vector <SegmentTy>table;
-    for (auto it : Device.SegmentList) {
-      table.push_back(it.second);
-    }
-    // Transfer table
-    DP2("Transfered at table\n");
-    void *tgt_table = Device.table_transfer(table);
+    Device.table_transfer();
     // Add tgt table
-    AT.addTable(tgt_table);
-    AT.addTableSize(table.size());
+    AT.addTable(Device.SegmentList.TgtMemPtr);
+    AT.addTableSize(Device.SegmentList.TgtList.size());
 
     int fake_literal = 878787;
     int fake_table_size = 13;

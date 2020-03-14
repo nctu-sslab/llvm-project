@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Transforms/IPO.h"
 
 using namespace llvm;
 using namespace std;
@@ -25,28 +26,36 @@ using namespace std;
 #define DB(STMT)
 #endif
 
-#define DEBUG_TYPE "hello"
+#define DEBUG_TYPE "omp-at"
+
+#define LLVM_MODULE
 
 namespace {
-  struct OmpTgtAddrTransPass : public ModulePass {
+  struct OmpTgtAddrTrans : public ModulePass {
 
     typedef  map<Function*, Function*> FunctionMapTy;
     static char ID; // Pass identification, replacement for typeid
-    unsigned int ParamID = 1;
-    int ConstMemSize = 1024;
 
     // Types
     IntegerType *IT;
     StructType *ST;
     PointerType *PT;
 
-    OmpTgtAddrTransPass() : ModulePass(ID) {}
+    Module *module;
+
+    OmpTgtAddrTrans() : ModulePass(ID) {
+#ifndef LLVM_MODULE
+      llvm::initializeOmpTgtAddrTransPass(*PassRegistry::getPassRegistry());
+#endif
+    }
+
 
     bool runOnFunction(Function &F) {
       return true;
     }
 
     // Param
+    // TODO kernel need to have some attribute nvvm annotation
     Function *cloneFuncWithATArg(Function *F) {
       // TODO
       vector<Type*> ArgsType;
@@ -59,7 +68,6 @@ namespace {
         ArgsType.push_back(arg.getType());
       }
       ArgsType.push_back(PT);
-      ArgsType.push_back(IT);
       FunctionType *FT = FunctionType::get(F->getReturnType(), ArgsType, false);
       Twine FuncName(F->getName());
 
@@ -77,8 +85,8 @@ namespace {
         }
       }
       // Add name to new args
-      NewArgs++->setName("__ATtable");
-      NewArgs->setName("__table_size");
+      NewArgs->setName("__ATtable");
+      //NewArgs->setName("__table_size");
       SmallVector<ReturnInst *, 8> Returns; // Ignore returns cloned.
 
       // Clone body
@@ -90,6 +98,7 @@ namespace {
 
     // Recursive
     // Store func called by Target function
+    // TODO Only collet functions use the pointers
     void getCalledFunctions(FunctionMapTy &Functions,
         Function *Target, CallGraph &CG) {
 
@@ -102,15 +111,24 @@ namespace {
       // get CallGraph
       for (auto &CR : *CGN) {
         Function *F = CR.second->getFunction();
+        if (!F) {
+          continue;
+        }
         getCalledFunctions(Functions, F, CG);
         Functions[F] = NULL;
       }
     }
 
+    void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
+      // TODO
+      // !omp_offload.info
+      // !nvvm.annotations
+
+    }
+
     void swapCallInst(FunctionMapTy &Functions, Function *F) {
       // Get last two args
       auto arg_it = F->arg_end();
-      Value *size_arg = --arg_it;
       Value *table_arg = --arg_it;
 
       vector<Instruction*> DeleteInst;
@@ -133,7 +151,6 @@ namespace {
               args.push_back(operand);
             }
             args.push_back(table_arg);
-            args.push_back(size_arg);
             /*for (auto it: args) {
               it->dump();
             }*/
@@ -174,8 +191,30 @@ namespace {
     }
 
     bool runOnModule(Module &M) override {
-
       bool changed = false;
+      errs() << "OmpTgtAddrTransPass is called\n";
+      module = &M;
+
+      // Use a metadata to avoid double application
+      if (M.getNamedMetadata("omptgtaddrtrans")) {
+        return changed;
+      } else if (!M.getNamedMetadata("nvvm.annotations")) {
+        errs() << "Error no nvvm.annotations metadata found!\n";
+        return changed;
+      } else {
+        M.getOrInsertNamedMetadata("omptgtaddrtrans");
+      }
+
+
+      /*
+      for (const auto &node : NvvmMeta->operands()) {
+        node->dump();
+        for (auto &op : node->operands()) {
+          op->dump();
+        }
+      }*/
+
+      // TODO Use init function
       // Create TableTy
       DataLayout DL(&M);
       vector<Type*> StructMem;
@@ -189,16 +228,35 @@ namespace {
 
       PT = PointerType::getUnqual(ST);
 
+      FunctionMapTy FunctionTransEntry; // Entry Functions after Transform
       FunctionMapTy FunctionTrans; // Functions after Transform
 
       // Get entry funcs
-      string EntryFuncName("f");
+      string EntryFuncName("__omp_offloading_");
       for (auto &F : M.functions()) {
         if (F.getName().contains(EntryFuncName)) {
-          FunctionTrans[&F] = NULL;
-          break;
+          FunctionTransEntry[&F] = NULL;
+          errs() << "Capture entry function: " << F.getName() << "\n";
+          continue;
         }
       }
+
+      if (FunctionTransEntry.size()) {
+        changed = true;
+      } else {
+        return changed;
+      }
+
+      for (auto E : FunctionTransEntry) {
+        Function *F = E.first;
+        FunctionTransEntry[F] = cloneFuncWithATArg(F);
+      }
+
+      // Add Functions to metadata
+      addEntryFunctionsAsKernel(FunctionTransEntry);
+
+
+      /*
       CallGraph CG(M);
       for (auto E : FunctionTrans) {
         Function *F = E.first;
@@ -206,20 +264,21 @@ namespace {
         getCalledFunctions(FunctionTrans, F, CG);
       }
 
-      if (FunctionTrans.size()) {
-        changed = true;
-      }
+
       for (auto E : FunctionTrans) {
-        // ValueMap for args
         Function *F = E.first;
         FunctionTrans[F] = cloneFuncWithATArg(F);
+      }
+
+      if (FunctionTrans.size()) {
+        changed = true;
       }
 
       // Change function call
       for (auto E : FunctionTrans) {
         Function *F = E.second;
         swapCallInst(FunctionTrans, F);
-      }
+      }*/
 
       // Remove old functions
       /*for (auto E : FunctionTrans) {
@@ -242,12 +301,22 @@ namespace {
   };
 }
 
-char OmpTgtAddrTransPass::ID = 0;
-static RegisterPass<OmpTgtAddrTransPass>
-Y("OmpTgtAddrTransPass", "OmpTgtAddrTransPass");
+char OmpTgtAddrTrans::ID = 0;
 
-//INITIALIZE_PASS_BEGIN(OmpTgtAddrTransPass, "OmpTgtAddrTransPass", "Scalar Replacement Of Aggregates", false, false)
+#ifdef LLVM_MODULE
+static RegisterPass<OmpTgtAddrTrans>
+Y("OmpTgtAddrTrans", "OmpTgtAddrTransPass Description");
+
+#else
+INITIALIZE_PASS(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
+
+ModulePass *llvm::createOmpTgtAddrTransPass() {
+  return new OmpTgtAddrTrans();
+}
+#endif
+
+//INITIALIZE_PASS_BEGIN(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
 //INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
-
 //INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-//INITIALIZE_PASS_END(OmpTgtAddrTransPass, "OmpTgtAddrTransPass", "Scalar Replacement Of Aggregates", false, false)
+//INITIALIZE_PASS_END(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
+//INITIALIZE_PASS_END(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Scalar Replacement Of Aggregates", false, false)

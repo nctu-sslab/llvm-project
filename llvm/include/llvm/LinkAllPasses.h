@@ -225,6 +225,8 @@ namespace {
       (void) llvm::createWarnMissedTransformationsPass();
       (void) llvm::createHardwareLoopsPass();
 
+      (void) llvm::createOmpTgtAddrTransPass();
+
       (void)new llvm::IntervalPartition();
       (void)new llvm::ScalarEvolutionWrapperPass();
       llvm::Function::Create(nullptr, llvm::GlobalValue::ExternalLinkage)->viewCFGOnly();

@@ -28,6 +28,9 @@ using namespace std;
 
 #define DEBUG_TYPE "omp-at"
 
+#define FAILED 1
+#define SUCCESS 0
+
 #define LLVM_MODULE
 
 namespace {
@@ -51,19 +54,47 @@ namespace {
       llvm::initializeOmpTgtAddrTransPass(*PassRegistry::getPassRegistry());
 #endif
     }
-bool runOnFunction(Function &F);
-Function *cloneFuncWithATArg(Function *F);
-void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
-void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs);
-void swapCallInst(FunctionMapTy &Functions, Function *F);
-void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
-bool runOnModule(Module &M) override;
-void getAnalysisUsage(AnalysisUsage &AU) const override;
+    int8_t init(Module &M);
+    bool runOnFunction(Function &F);
+    Function *cloneFuncWithATArg(Function *F);
+    void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
+    void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs);
+    void swapCallInst(FunctionMapTy &Functions, Function *F);
+    void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
+    bool runOnModule(Module &M) override;
+    void getAnalysisUsage(AnalysisUsage &AU) const override;
   };
 }
 
 bool OmpTgtAddrTrans::runOnFunction(Function &F) {
   return true;
+}
+
+int8_t OmpTgtAddrTrans::init(Module &M) {
+
+  errs() << "OmpTgtAddrTransPass is called\n";
+  module = &M;
+
+  // Use a metadata to avoid double application
+  if (M.getNamedMetadata("omptgtaddrtrans")) {
+    return FAILED;
+  } else if (!M.getNamedMetadata("nvvm.annotations")) {
+    errs() << "Error no nvvm.annotations metadata found!\n";
+    return FAILED;
+  } else {
+    M.getOrInsertNamedMetadata("omptgtaddrtrans");
+  }
+  // Create TableTy
+  DataLayout DL(&M);
+  vector<Type*> StructMem;
+  IT = IntegerType::get(M.getContext(), DL.getPointerSizeInBits());
+  for (int i = 0; i < 4; i++) {
+    StructMem.push_back(IT);
+  }
+  ST = StructType::create(M.getContext(), StructMem, "struct.ATTableTy", false);
+  PT = PointerType::getUnqual(ST);
+
+  return SUCCESS;
 }
 
 // Param
@@ -221,33 +252,10 @@ void OmpTgtAddrTrans::eraseFunction(FunctionMapTy FunctionTrans, Function* F) {
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
   bool changed = false;
-  errs() << "OmpTgtAddrTransPass is called\n";
-  module = &M;
 
-  // Use a metadata to avoid double application
-  if (M.getNamedMetadata("omptgtaddrtrans")) {
+  if (init(M)) {
     return changed;
-  } else if (!M.getNamedMetadata("nvvm.annotations")) {
-    errs() << "Error no nvvm.annotations metadata found!\n";
-    return changed;
-  } else {
-    M.getOrInsertNamedMetadata("omptgtaddrtrans");
   }
-
-
-  // TODO Use init function
-  // Create TableTy
-  DataLayout DL(&M);
-  vector<Type*> StructMem;
-  IT = IntegerType::get(M.getContext(), DL.getPointerSizeInBits());
-  for (int i = 0; i < 4; i++) {
-    StructMem.push_back(IT);
-  }
-  ST = StructType::create(M.getContext(), StructMem, "ATTableTy", false);
-  // Change name to struct.xxx
-  //ST = StructType::create(M.getContext(), StructMem, "ATTableTy", false);
-
-  PT = PointerType::getUnqual(ST);
 
   FunctionMapTy FunctionTransEntry; // Entry Functions after Transform
   FunctionMapTy FunctionTrans; // Functions after Transform

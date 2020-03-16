@@ -133,9 +133,26 @@ void OmpTgtAddrTrans::getCalledFunctions(FunctionMapTy &Functions,
 
 void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
   // TODO
+  // Does these two named metadata important??
   // !omp_offload.info
   // !nvvm.annotations
 
+  // Prepare metadata
+  vector<Metadata *> PreMetaList;
+  PreMetaList.push_back(MDString::get(module->getContext(), "kernel"));
+  IntegerType *IT32 = IntegerType::get(module->getContext(), 32);
+  ConstantInt *Const = ConstantInt::get(IT32, 1, false);
+  PreMetaList.push_back(ConstantAsMetadata::get(Const));
+
+  // Append metadata of kernel entry to nvvm.annotations
+  auto NvvmMeta = module->getNamedMetadata("nvvm.annotations");
+  for (auto &E : EntryFuncs) {
+    Function *F = E.second;
+    vector<Metadata*> MetaList = PreMetaList;
+    MetaList.insert(MetaList.begin(), ValueAsMetadata::get(F));
+    MDTuple *node = MDNode::get(module->getContext(), MetaList);
+    NvvmMeta->addOperand(node);
+  }
 }
 
 void OmpTgtAddrTrans::swapCallInst(FunctionMapTy &Functions, Function *F) {
@@ -217,14 +234,6 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
     M.getOrInsertNamedMetadata("omptgtaddrtrans");
   }
 
-
-  /*
-  for (const auto &node : NvvmMeta->operands()) {
-    node->dump();
-    for (auto &op : node->operands()) {
-      op->dump();
-    }
-  }*/
 
   // TODO Use init function
   // Create TableTy

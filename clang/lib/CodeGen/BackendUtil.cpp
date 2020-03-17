@@ -70,6 +70,7 @@
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
 #include <memory>
+
 using namespace clang;
 using namespace llvm;
 
@@ -343,7 +344,7 @@ static TargetLibraryInfoImpl *createTLII(llvm::Triple &TargetTriple,
     break;
   case CodeGenOptions::MASSV:
     TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::MASSV);
-    break;    
+    break;
   case CodeGenOptions::SVML:
     TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::SVML);
     break;
@@ -716,6 +717,30 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
 
   if (!CodeGenOpts.SampleProfileFile.empty())
     PMBuilder.PGOSampleUse = CodeGenOpts.SampleProfileFile;
+
+  // FIXME Add omp AT pass here?
+  // TODO Remove IR print when done
+  if (TargetTriple.isNVPTX()) {
+    std::error_code ec1, ec2;
+    static raw_fd_ostream RFO1("/tmp/PreOmpTgtAddrTransPass.bc",
+        ec1, sys::fs::OF_None);
+    static raw_fd_ostream RFO2("/tmp/PostOmpTgtAddrTransPass.bc",
+        ec2, sys::fs::OF_None);
+
+    if (ec1 || ec2) {
+      errs() << "Create raw_fd_ostream failed: " << ec1.message()
+        << ec2.message() << "Stop do createBitcodeWriterPass\n";
+    }
+    // Print IR before Pass
+    MPM.add(createVerifierPass());
+    MPM.add(createPrintModulePass(RFO1, "", false));
+
+    MPM.add(createOmpTgtAddrTransPass());
+
+    // Print IR after Pass
+    MPM.add(createVerifierPass());
+    MPM.add(createPrintModulePass(RFO2, "", false));
+  }
 
   PMBuilder.populateFunctionPassManager(FPM);
   PMBuilder.populateModulePassManager(MPM);

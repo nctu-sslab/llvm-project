@@ -33,6 +33,8 @@ using namespace std;
 #define FAILED 1
 #define SUCCESS 0
 
+// define LLVM_MODULE if emit llvm module
+// otherwise, visible by llvm
 #define LLVM_MODULE
 
 namespace {

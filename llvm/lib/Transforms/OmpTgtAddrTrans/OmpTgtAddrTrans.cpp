@@ -3,6 +3,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include <map>
+#include <queue>
 
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/Statistic.h"
@@ -16,6 +17,7 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Transforms/IPO.h"
+//#include "llvm/Analysis/MemoryDependenceAnalysis.h"
 
 using namespace llvm;
 using namespace std;
@@ -38,6 +40,9 @@ namespace {
 
     typedef  map<Function*, Function*> FunctionMapTy;
 
+    FunctionMapTy FunctionTransEntry; // Entry Functions after Transform
+    FunctionMapTy FunctionTrans; // Functions after Transform
+
     // Types
     IntegerType *IT;
     StructType *ST;
@@ -45,6 +50,8 @@ namespace {
 
     // llvm Module
     Module *module;
+
+ //   MemoryDependenceResults *MD;
 
     public:
     static char ID; // Pass identification, replacement for typeid
@@ -55,19 +62,16 @@ namespace {
 #endif
     }
     int8_t init(Module &M);
-    bool runOnFunction(Function &F);
     Function *cloneFuncWithATArg(Function *F);
-    void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
+    //void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
     void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs);
-    void swapCallInst(FunctionMapTy &Functions, Function *F);
+    CallInst *swapCallInst(CallInst *CI);
     void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
     bool runOnModule(Module &M) override;
     void getAnalysisUsage(AnalysisUsage &AU) const override;
+    void traceArgInFunc(Function *, Argument*);
+    bool isATFunction(Function *Func);
   };
-}
-
-bool OmpTgtAddrTrans::runOnFunction(Function &F) {
-  return true;
 }
 
 int8_t OmpTgtAddrTrans::init(Module &M) {
@@ -94,7 +98,16 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   ST = StructType::create(M.getContext(), StructMem, "struct.ATTableTy", false);
   PT = PointerType::getUnqual(ST);
 
+  // Get analysis
+  //MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
   return SUCCESS;
+}
+
+bool OmpTgtAddrTrans::isATFunction(Function *Func) {
+  if (Func->getName().endswith("AT")) {
+    return true;
+  }
+  return false;
 }
 
 // Param
@@ -139,10 +152,95 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
   return NewFunc;
 }
 
+// Arg is CPU addr, keep trace it and insert AT function
+void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
+  queue<pair<Value*, int>> Vals;
+  set<User*> UserList;
+
+  if (!isATFunction(Func)) {
+    errs() << "Tried to trace non-AT function: ";
+    Func->getFunctionType()->dump();
+    return;
+  }
+  // TODO keep trace which Instruction has been traced
+
+  // Check if this has been cloned
+
+  Vals.push({Arg,0});
+  while (!Vals.empty()) {
+    Value *V = Vals.front().first;
+    int NestPtr = Vals.front().second;
+    Vals.pop();
+    for (auto &Use : V->uses()) {
+      User *U = Use.getUser();
+      // Check if User done before
+      if (UserList.find(U) == UserList.end()) {
+        //U->dump();
+      } else {
+        continue;
+      }
+      if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getPointerOperand() == dyn_cast<Value>(V)) {
+          assert(0 && "StoreInst to CPU address");
+          continue;
+        }
+        Vals.push({SI->getPointerOperand(), NestPtr + 1});
+      } else if (isa<LoadInst>(U)) {
+        if (NestPtr == 0) {
+          errs() << "!!!!!!!!!! Insert AT function here!!!!!!\n";
+        } else {
+          Vals.push({U, NestPtr - 1});
+        }
+      } else if (CallInst *CI = dyn_cast<CallInst>(U)) {
+        // check if swap callinst
+        unsigned ArgIdx = Use.getOperandNo();
+        Function *F = CI->getCalledFunction();
+        if (!isATFunction(F)) {
+          // Cause redundant use?? TODO
+          CI = swapCallInst(CI);
+          F = CI->getCalledFunction();
+        }
+        traceArgInFunc(F, F->arg_begin() + ArgIdx);
+      } else if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(U)) {
+        if (GEPI->getPointerOperand() == dyn_cast<Value>(V)) {
+          Vals.push({U, NestPtr});
+        }
+      } else if (Instruction *Inst = dyn_cast<Instruction>(U)) {
+        errs() << "Unknown inst\n";
+        Inst->dump();
+        continue;
+      } else {
+        errs() << "Unknown use\n";
+        U->dump();
+        continue;
+      }
+      UserList.insert(U);
+    }
+  }
+
+  /*
+  MD = &getAnalysis<MemoryDependenceWrapperPass>(*Func).getMemDep();
+  for (auto &BB: *Func) {
+    for (auto &I : BB) {
+      if (StoreInst *MI = dyn_cast<StoreInst>(&I)) {
+        Instruction *resultI = MD->getDependency(&I).getInst();
+        errs() << "\nDep: << ";
+        I.dump();
+        if (resultI) {
+          resultI->dump();
+        } else {
+          errs() << "abnormal\n";
+        }
+
+      }
+    }
+  }
+  */
+}
+
 // Recursive
 // Store func called by Target function
-// TODO Only collet functions use the pointers
-void OmpTgtAddrTrans::getCalledFunctions(FunctionMapTy &Functions,
+/*void OmpTgtAddrTrans::getCalledFunctions(FunctionMapTy &Functions,
     Function *Target, CallGraph &CG) {
 
   CallGraphNode *CGN = CG[Target];
@@ -160,7 +258,7 @@ void OmpTgtAddrTrans::getCalledFunctions(FunctionMapTy &Functions,
     getCalledFunctions(Functions, F, CG);
     Functions[F] = NULL;
   }
-}
+}*/
 
 void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
   // TODO
@@ -186,47 +284,36 @@ void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
   }
 }
 
-void OmpTgtAddrTrans::swapCallInst(FunctionMapTy &Functions, Function *F) {
-  // Get last two args
-  auto arg_it = F->arg_end();
-  Value *table_arg = --arg_it;
-
-  vector<Instruction*> DeleteInst;
-
-  // Find call inst
-  // Iterate BB
-  for (auto &BB : *F) {
-    for (auto &Inst : BB) {
-      if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
-        Function *callee = CI->getCalledFunction();
-        auto func = Functions.find(callee);
-        if (func == Functions.end()) {
-          errs() << "Untracked function is called\n";
-          continue;
-        }
-        Function *NewFunc = func->second;
-        // Get old arg
-        vector<Value*> args;
-        for (auto &operand : CI->args()) {
-          args.push_back(operand);
-        }
-        args.push_back(table_arg);
-        /*for (auto it: args) {
-          it->dump();
-        }*/
-        // Name is not important
-        CallInst *CINew = CallInst::Create (NewFunc->getFunctionType(), NewFunc,
-           args, NewFunc->getName(), CI);
-        CI->replaceAllUsesWith(CINew);
-        CI->dropAllReferences();
-        DeleteInst.push_back(CI);
-      }
-    }
+// swap CallInst to call AT function
+CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI) {
+  // Check if callee is transformed
+  Function *Callee = CI->getCalledFunction();
+  if (isATFunction(Callee)) {
+    return CI;
+  } else if (FunctionTrans.find(Callee) == FunctionTrans.end()) {
+    FunctionTrans[Callee] = cloneFuncWithATArg(Callee);
   }
-  // Erase replaced function
-  for (auto Inst : DeleteInst) {
-    Inst->eraseFromParent ();
+  Function *NewCallee = FunctionTrans[Callee];
+
+  // Get table Arg of parent function
+  Function *ParentFunc = CI->getFunction();
+  Argument *TableArg = (ParentFunc->arg_end() - 1);
+
+  // Get old arg
+  vector<Value*> ArgsOfNew;
+  for (auto &operand : CI->args()) {
+    ArgsOfNew.push_back(operand);
   }
+  ArgsOfNew.push_back(TableArg);
+
+  // Create new inst
+  CallInst *CINew = NULL;
+  CINew = CallInst::Create(NewCallee->getFunctionType(), NewCallee, ArgsOfNew);
+  CINew->insertBefore(CI);
+  CI->replaceAllUsesWith(CINew);
+  CI->dropAllReferences();
+  CI->eraseFromParent ();
+  return CINew;
 }
 
 void OmpTgtAddrTrans::eraseFunction(FunctionMapTy FunctionTrans, Function* F) {
@@ -257,9 +344,6 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
     return changed;
   }
 
-  FunctionMapTy FunctionTransEntry; // Entry Functions after Transform
-  FunctionMapTy FunctionTrans; // Functions after Transform
-
   // Get entry funcs
   string EntryFuncName("__omp_offloading_");
   for (auto &F : M.functions()) {
@@ -284,47 +368,31 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   // Add Functions to metadata
   addEntryFunctionsAsKernel(FunctionTransEntry);
 
-
-  /*
-  CallGraph CG(M);
-  for (auto E : FunctionTrans) {
-    Function *F = E.first;
-    // TODO what if cross module call
-    getCalledFunctions(FunctionTrans, F, CG);
-  }
-
-
-  for (auto E : FunctionTrans) {
-    Function *F = E.first;
-    FunctionTrans[F] = cloneFuncWithATArg(F);
-  }
-
-  if (FunctionTrans.size()) {
-    changed = true;
-  }
-
-  // Change function call
-  for (auto E : FunctionTrans) {
+  for (auto &E : FunctionTransEntry) {
     Function *F = E.second;
-    swapCallInst(FunctionTrans, F);
-  }*/
+    size_t EntryArgSize = F->arg_size() - 1;
+    auto ArgItr = F->arg_begin();
+    // All pointer args of entry function is CPU address
+    for (size_t i = 0; i < EntryArgSize; i++, ArgItr++) {
+      if (auto PT = dyn_cast<PointerType> (ArgItr->getType())) {
+        if (PT->getElementType()->isPointerTy()) {
+          traceArgInFunc(F, ArgItr);
+        }
+      }
+    }
+  }
 
-  // Remove old functions
-  /*for (auto E : FunctionTrans) {
-    Function *F = E.first;
-    eraseFunction(FunctionTrans, F);
-  }*/
   return changed;
 }
 
 void OmpTgtAddrTrans::getAnalysisUsage(AnalysisUsage &AU) const {
-  //AU.getRequiredSet();
-  //AU.setPreservesCFG();
-  //AU.setPreservesAll();
-  //AU.addRequiredID(LoopInfoWrapperPass::ID);
-  AU.addRequired<LoopInfoWrapperPass>();
-  AU.addRequired<DominatorTreeWrapperPass>();
-  //AU.getRequiredSet();
+  AU.setPreservesCFG();
+//  AU.addRequired<MemoryDependenceWrapperPass>();
+//  AU.addRequired<DominatorTreeWrapperPass>();
+//  AU.addRequired<AAResultsWrapperPass>();
+//  AU.addRequired<LoopInfoWrapperPass>();
+//  AU.addRequired<DominatorTreeWrapperPass>();
+//  AU.getRequiredSet();
 }
 
 char OmpTgtAddrTrans::ID = 0;

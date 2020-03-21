@@ -90,6 +90,11 @@ enum OpenMPOffloadingRequiresDirFlags {
   OMP_REQ_DYNAMIC_ALLOCATORS      = 0x010
 };
 
+enum OpenMPOffloadingMode {
+  OMP_OFFMODE_NORMAL                 = 0x001,
+  OMP_OFFMODE_ADDR_TRANS             = 0x002
+};
+
 /// This struct is a record of an entry point or global. For a function
 /// entry point the size is expected to be zero
 struct __tgt_offload_entry {

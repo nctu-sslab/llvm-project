@@ -37,7 +37,6 @@ void *AddressTranslate::passLiteral(void *literal, int64_t size) {
 }
 
 void AddressTranslate::addTable(void *tgt_table) {
-  DP2("Add tgt_table: %p\n", tgt_table);
   this->tgt_table = tgt_table;
 }
 

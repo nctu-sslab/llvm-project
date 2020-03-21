@@ -102,7 +102,6 @@ struct SegmentTy {
   uintptr_t HstPtrBegin;
   uintptr_t HstPtrEnd;
   uintptr_t TgtPtrBegin;
-  intptr_t bias;
 };
 
 // std::map is better for lookup

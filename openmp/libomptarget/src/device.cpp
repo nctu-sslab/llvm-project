@@ -305,21 +305,24 @@ void DeviceTy::init() {
     RTL->init_requires(RTLRequiresFlags);
   int32_t rc = RTL->init_device(RTLDeviceID);
   if (rc == OFFLOAD_SUCCESS) {
-    if (getenv("OMP_AT")) {
-      //DP2("Address Translate Enabled\n");
-      fprintf(stderr, "[omp-dc] Address Translate Enabled\n");
-      IsATEnabled = true;
-    } else {
-      IsATEnabled = false;
-    }
-    if (getenv("OMP_BULK") || IsATEnabled) {
-      //DP2("Bulk Transfer Enabled\n");
-      fprintf(stderr, "[omp-dc] Bulk Transfer Enabled\n");
+    string EnabledOpt;
+    IsBulkEnabled = false;
+    IsATEnabled = false;
+    EnabledOpt.append(" Offloading");
+    if (getenv("OMP_BULK") || getenv("OMP_AT")) {
+      EnabledOpt.append(" BulkTransfer");
       IsBulkEnabled = true;
-    } else {
-      IsBulkEnabled = false;
     }
-    fprintf(stderr, "[omp-dc] Offloading Enabled\n");
+    if (getenv("OMP_AT")) {
+      if (RTL->set_mode) {
+        int32_t ret = RTL->set_mode(OMP_OFFMODE_ADDR_TRANS);
+        EnabledOpt.append(" AddrTranslate");
+        IsATEnabled = true;
+      } else {
+        fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
+      }
+    }
+    fprintf(stderr, "[omp-dc]%s Enabled\n", EnabledOpt.c_str());
     IsInit = true;
   }
 }
@@ -513,6 +516,7 @@ void DeviceTy::table_transfer() {
     i.bias = (intptr_t)i.TgtPtrBegin - (intptr_t)i.HstPtrBegin;
   }*/
   // TODO Only copy useful page
+  // TODO Using Small vector
   auto &table = SegmentList.TgtList;
   table.clear();
 
@@ -521,8 +525,9 @@ void DeviceTy::table_transfer() {
   for (auto &it : SegmentList) {
     table.push_back(it.second);
   }
+  table[0].HstPtrBegin = table.size() - 1;
+
   int table_size = table.size() * sizeof(SegmentTy);
-  table[0].HstPtrBegin = table_size;
 
   // Size is bigger than before
   if (SegmentList.TgtMemSize < table_size) {
@@ -534,7 +539,7 @@ void DeviceTy::table_transfer() {
     SegmentList.TgtMemSize = NewSize;
   }
   data_submit(SegmentList.TgtMemPtr, &table[0],table_size);
-  DP2("Transfered AT table");
+  DP2("Transfered AT table\n");
 }
 
 // Add segment, alloc later

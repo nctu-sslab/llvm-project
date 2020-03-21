@@ -69,14 +69,21 @@ enum ExecutionModeType {
 /// Use a single entity to encode a kernel and a set of flags
 struct KernelTy {
   CUfunction Func;
+  CUfunction FuncAT;
 
   // execution mode of kernel
   // 0 - SPMD mode (without master warp)
   // 1 - Generic mode (with master warp)
   int8_t ExecutionMode;
 
-  KernelTy(CUfunction _Func, int8_t _ExecutionMode)
-      : Func(_Func), ExecutionMode(_ExecutionMode) {}
+  std::string KerName;
+  bool HasAT;
+
+  KernelTy(CUfunction _Func, int8_t _ExecutionMode, char *_Name)
+      : Func(_Func), ExecutionMode(_ExecutionMode), HasAT(false), KerName(_Name) {}
+
+  KernelTy(CUfunction _Func, CUfunction _ATFunc, int8_t _ExecutionMode, char *_Name)
+      : Func(_Func), FuncAT(_ATFunc), ExecutionMode(_ExecutionMode), HasAT(true), KerName(_Name){}
 };
 
 /// Device envrionment data
@@ -113,6 +120,9 @@ public:
 
   // OpenMP Requires Flags
   int64_t RequiresFlags;
+
+  // OpenMP Offload Mode
+  int32_t OffloadMode;
 
   //static int EnvNumThreads;
   static const int HardTeamLimit = 1<<16; // 64k
@@ -175,7 +185,7 @@ public:
     E.Table.EntriesBegin = E.Table.EntriesEnd = 0;
   }
 
-  RTLDeviceInfoTy() {
+  RTLDeviceInfoTy() : OffloadMode(OMP_OFFMODE_NORMAL) {
 #ifdef OMPTARGET_DEBUG
     if (char *envStr = getenv("LIBOMPTARGET_DEBUG")) {
       DebugLevel = std::stoi(envStr);
@@ -430,6 +440,7 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
       CUdeviceptr cuptr;
       size_t cusize;
       err = cuModuleGetGlobal(&cuptr, &cusize, cumod, e->name);
+      DP("cuModuleGetGlobal Name: %s\n", e->name);
 
       if (err != CUDA_SUCCESS) {
         DP("Loading global '%s' (Failed)\n", e->name);
@@ -474,7 +485,10 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
     }
 
     CUfunction fun;
+    CUfunction funAT;
+    bool HasAT = true;
     err = cuModuleGetFunction(&fun, cumod, e->name);
+
 
     if (err != CUDA_SUCCESS) {
       DP("Loading '%s' (Failed)\n", e->name);
@@ -484,6 +498,20 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
 
     DP("Entry point " DPxMOD " maps to %s (" DPxMOD ")\n",
         DPxPTR(e - HostBegin), e->name, DPxPTR(fun));
+
+    // Load AT function
+    std::string ATFuncName(e->name);
+    ATFuncName.append("_AT");
+    err = cuModuleGetFunction(&funAT, cumod, ATFuncName.c_str());
+
+    if (err != CUDA_SUCCESS) {
+      DP("Loading '%s' (Failed)\n", ATFuncName.c_str());
+      CUDA_ERR_STRING(err);
+      HasAT = false;
+    } else {
+      DP("Entry point " DPxMOD " maps to %s (" DPxMOD ")\n",
+          DPxPTR(e - HostBegin), ATFuncName.c_str(), DPxPTR(funAT));
+    }
 
     // default value GENERIC (in case symbol is missing from cubin file)
     int8_t ExecModeVal = ExecutionModeType::GENERIC;
@@ -522,10 +550,15 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
       CUDA_ERR_STRING(err);
     }
 
-    KernelsList.push_back(KernelTy(fun, ExecModeVal));
+    if (HasAT) {
+      KernelsList.push_back(KernelTy(fun, funAT, ExecModeVal, e->name));
+    } else {
+      KernelsList.push_back(KernelTy(fun, ExecModeVal, e->name));
+    }
 
     __tgt_offload_entry entry = *e;
     entry.addr = (void *)&KernelsList.back();
+    DP("New Kernel: %p\n", entry.addr);
     DeviceInfo.addOffloadEntry(device_id, entry);
   }
 
@@ -680,6 +713,7 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   }
 
   KernelTy *KernelInfo = (KernelTy *)tgt_entry_ptr;
+  DP("Load KernelInfo @%p\n", KernelInfo);
 
   int cudaThreadsPerBlock;
 
@@ -704,8 +738,13 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   }
 
   int kernel_limit;
-  err = cuFuncGetAttribute(&kernel_limit,
-      CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->Func);
+  if (KernelInfo->HasAT) {
+    err = cuFuncGetAttribute(&kernel_limit,
+        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->FuncAT);
+  } else {
+    err = cuFuncGetAttribute(&kernel_limit,
+        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->Func);
+  }
   if (err == CUDA_SUCCESS) {
     if (kernel_limit < cudaThreadsPerBlock) {
       cudaThreadsPerBlock = kernel_limit;
@@ -757,8 +796,14 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   DP("Launch kernel with %d blocks and %d threads\n", cudaBlocksPerGrid,
      cudaThreadsPerBlock);
 
-  err = cuLaunchKernel(KernelInfo->Func, cudaBlocksPerGrid, 1, 1,
-      cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
+  if (DeviceInfo.OffloadMode == OMP_OFFMODE_ADDR_TRANS && KernelInfo->HasAT) {
+    DP("Using AT Kernel\n");
+    err = cuLaunchKernel(KernelInfo->FuncAT, cudaBlocksPerGrid, 1, 1,
+        cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
+  } else {
+    err = cuLaunchKernel(KernelInfo->Func, cudaBlocksPerGrid, 1, 1,
+        cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
+  }
   if (err != CUDA_SUCCESS) {
     DP("Device kernel launch failed!\n");
     CUDA_ERR_STRING(err);
@@ -787,6 +832,27 @@ int32_t __tgt_rtl_run_target_region(int32_t device_id, void *tgt_entry_ptr,
   const int32_t thread_limit = 0;
   return __tgt_rtl_run_target_team_region(device_id, tgt_entry_ptr, tgt_args,
       tgt_offsets, arg_num, team_num, thread_limit, 0);
+}
+
+int32_t __tgt_rtl_set_mode(int32_t mode) {
+  switch (mode) {
+    case OMP_OFFMODE_ADDR_TRANS:
+      // Check every kernel has AT
+      int all_kernel_AT = 1;
+      for (auto &K : KernelsList) {
+        if (!K.HasAT) {
+          all_kernel_AT = 0;
+        }
+      }
+      if (all_kernel_AT) {
+        DP("Set rtl mode to OMP_OFFMODE_ADDR_TRANS\n");
+      } else {
+        DP("Failed to set rtl mode to OMP_OFFMODE_ADDR_TRANS\n");
+        return OFFLOAD_FAIL;
+      }
+  }
+  DeviceInfo.OffloadMode = mode;
+  return OFFLOAD_SUCCESS;
 }
 
 #ifdef __cplusplus

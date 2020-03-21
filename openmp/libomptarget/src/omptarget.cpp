@@ -922,6 +922,8 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
         // FIXME skip one search
         // TgtPtrBegin does not matters
         TgtPtrBegin = AT.passArg(TgtPtrBegin, arg_sizes[i]);
+        // For Fake AT
+
       }
       TgtBaseOffset = (intptr_t)HstPtrBase - (intptr_t)HstPtrBegin;
 
@@ -934,6 +936,18 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     tgtArgsPositions[i] = tgt_args.size();
     tgt_args.push_back(TgtPtrBegin);
     tgt_offsets.push_back(TgtBaseOffset);
+  }
+  // Insert  table
+  if (Device.IsATEnabled) {
+    tgt_args.push_back(Device.SegmentList.TgtMemPtr);
+    tgt_offsets.push_back(0);
+    // check the data on gpu
+    /*int size = Device.SegmentList.TgtList.size();
+    SegmentTy TmpTable[size];
+    Device.data_retrieve(TmpTable, Device.SegmentList.TgtMemPtr, size*sizeof(SegmentTy));
+    for (int i = 0; i < size; i++) {
+      TmpTable[i].dump();
+    }*/
   }
 
   assert(tgt_args.size() == tgt_offsets.size() &&

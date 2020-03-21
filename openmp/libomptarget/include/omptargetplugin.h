@@ -86,6 +86,7 @@ int32_t __tgt_rtl_run_target_team_region(int32_t ID, void *Entry, void **Args,
                                          ptrdiff_t *Offsets, int32_t NumArgs,
                                          int32_t NumTeams, int32_t ThreadLimit,
                                          uint64_t loop_tripcount);
+int32_t __tgt_rtl_set_mode(int32_t mode);
 
 #ifdef __cplusplus
 }

@@ -85,7 +85,9 @@ EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
 ////////////////////////////////////////////////////////////////////////////////
 /// unloads a target shared library
 EXTERN void __tgt_unregister_lib(__tgt_bin_desc *desc) {
-  Perf.dump();
+  if (getenv("DP2")) {
+    Perf.dump();
+  }
   RTLs.UnregisterLib(desc);
 }
 

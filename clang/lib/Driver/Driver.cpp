@@ -4172,6 +4172,19 @@ InputInfo Driver::BuildJobsForActionNoCache(
                        BaseInput);
   }
 
+  std::string ObjName, SrcName;
+  if (JA->getKind() == Action::LinkJobClass &&
+      T->getToolChain().getTriple().isNVPTX()) {
+    // Put prebuilt obj path into InputInfos
+    // If we can get llvm src dir??
+    std::string PreBuiltPath("/home/pschen/llvm/thesis/llvm-project/llvm");
+    PreBuiltPath.append("/lib/Transforms/OmpTgtAddrTrans/obj");
+    ObjName = PreBuiltPath + "/AT.o";
+    SrcName = PreBuiltPath + "/AT.c";
+
+    InputInfos.push_back(driver::InputInfo(driver::types::TY_Object,
+         ObjName.c_str(), SrcName.c_str()));
+  }
   if (CCCPrintBindings && !CCGenDiagnostics) {
     llvm::errs() << "# \"" << T->getToolChain().getTripleString() << '"'
                  << " - \"" << T->getName() << "\", inputs: [";

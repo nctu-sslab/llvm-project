@@ -718,28 +718,33 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
   if (!CodeGenOpts.SampleProfileFile.empty())
     PMBuilder.PGOSampleUse = CodeGenOpts.SampleProfileFile;
 
-  // FIXME Add omp AT pass here?
-  // TODO Remove IR print when done
   if (TargetTriple.isNVPTX()) {
+    bool DumpIR = true;
     std::error_code ec1, ec2;
-    static raw_fd_ostream RFO1("/tmp/PreOmpTgtAddrTransPass.bc",
-        ec1, sys::fs::OF_None);
-    static raw_fd_ostream RFO2("/tmp/PostOmpTgtAddrTransPass.bc",
-        ec2, sys::fs::OF_None);
+    llvm::Twine Dir("/tmp/");
+    llvm::Twine Prefix = Dir.concat(TheModule->getSourceFileName()); llvm::Twine PrellFile = Prefix.concat("PreOmpATPass.ll");
+    llvm::Twine PostllFile = Prefix.concat("PostOmpATransPass.ll");
+    static raw_fd_ostream RFO1(PrellFile.str(), ec1, sys::fs::OF_None);
+    static raw_fd_ostream RFO2(PostllFile.str(), ec2, sys::fs::OF_None);
 
     if (ec1 || ec2) {
       errs() << "Create raw_fd_ostream failed: " << ec1.message()
         << ec2.message() << "Stop do createBitcodeWriterPass\n";
+      DumpIR = false;
     }
     // Print IR before Pass
-    MPM.add(createVerifierPass());
-    MPM.add(createPrintModulePass(RFO1, "", false));
+    if (DumpIR) {
+      MPM.add(createVerifierPass());
+      MPM.add(createPrintModulePass(RFO1, "", false));
+    }
 
     MPM.add(createOmpTgtAddrTransPass());
 
     // Print IR after Pass
-    MPM.add(createVerifierPass());
-    MPM.add(createPrintModulePass(RFO2, "", false));
+    if (DumpIR) {
+      MPM.add(createVerifierPass());
+      MPM.add(createPrintModulePass(RFO2, "", false));
+    }
   }
 
   PMBuilder.populateFunctionPassManager(FPM);

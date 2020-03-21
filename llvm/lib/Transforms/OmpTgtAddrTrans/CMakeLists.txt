@@ -10,6 +10,8 @@ if(WIN32 OR CYGWIN)
   set(LLVM_LINK_COMPONENTS Core Support)
 endif()
 
+add_definitions(-DLLVM_MODULE)
+
 add_llvm_library( LLVMOmpTgtAddrTrans MODULE BUILDTREE_ONLY
   OmpTgtAddrTrans.cpp
 

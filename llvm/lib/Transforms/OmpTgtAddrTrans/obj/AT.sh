@@ -10,3 +10,6 @@ chmod a+w AT.cubin
 
 # Bypass clang remove this file
 chmod a-w AT.cubin
+
+# Remove mid files
+rm -f AT.bc AT.s AT.ll

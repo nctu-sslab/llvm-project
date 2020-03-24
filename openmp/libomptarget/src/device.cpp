@@ -354,18 +354,18 @@ __tgt_target_table *DeviceTy::load_binary(void *Img) {
 // Submit data to device.
 int32_t DeviceTy::data_submit(void *TgtPtrBegin, void *HstPtrBegin,
     int64_t Size) {
-  Perf.H2DTransfer.start();
+  PERF_WRAP(Perf.H2DTransfer.start();)
   int32_t ret = RTL->data_submit(RTLDeviceID, TgtPtrBegin, HstPtrBegin, Size);
-  Perf.H2DTransfer.end();
+  PERF_WRAP(Perf.H2DTransfer.end();)
   return ret;
 }
 
 // Retrieve data from device.
 int32_t DeviceTy::data_retrieve(void *HstPtrBegin, void *TgtPtrBegin,
     int64_t Size) {
-  Perf.D2HTransfer.start();
+  PERF_WRAP(Perf.D2HTransfer.start();)
   int32_t ret =  RTL->data_retrieve(RTLDeviceID, HstPtrBegin, TgtPtrBegin, Size);
-  Perf.D2HTransfer.end();
+  PERF_WRAP(Perf.D2HTransfer.end();)
   return ret;
 }
 
@@ -397,7 +397,7 @@ int32_t DeviceTy::update_suspend_list() {
 
   int i = 0;
   while (!UpdatePtrList.empty()) {
-    Perf.UpdatePtr.start();
+    PERF_WRAP(Perf.UpdatePtr.start();)
     struct UpdatePtrTy &upt = UpdatePtrList.front();
     void *PtrBaseAddr, *PtrValue, *PtrValueBegin;
     PtrBaseAddr = bulkGetTgtPtrBegin(upt.PtrBaseAddr,sizeof(void*));
@@ -416,7 +416,7 @@ int32_t DeviceTy::update_suspend_list() {
     //UpdatePtrList.pop_front();
     UpdatePtrList.pop();
     ++i;
-    Perf.UpdatePtr.end();
+    PERF_WRAP(Perf.UpdatePtr.end();)
   }
   return 0;
 }
@@ -447,10 +447,10 @@ int32_t DeviceTy::dump_map() {
 // Run region on device
 int32_t DeviceTy::run_region(void *TgtEntryPtr, void **TgtVarsPtr,
     ptrdiff_t *TgtOffsets, int32_t TgtVarsSize) {
-  Perf.Kernel.start();
+  PERF_WRAP(Perf.Kernel.start();)
   int32_t ret = RTL->run_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
       TgtVarsSize);
-  Perf.Kernel.end();
+  PERF_WRAP(Perf.Kernel.end();)
   return ret;
 }
 
@@ -458,10 +458,10 @@ int32_t DeviceTy::run_region(void *TgtEntryPtr, void **TgtVarsPtr,
 int32_t DeviceTy::run_team_region(void *TgtEntryPtr, void **TgtVarsPtr,
     ptrdiff_t *TgtOffsets, int32_t TgtVarsSize, int32_t NumTeams,
     int32_t ThreadLimit, uint64_t LoopTripCount) {
-  Perf.Kernel.start();
+  PERF_WRAP(Perf.Kernel.start();)
   int32_t ret = RTL->run_team_region(RTLDeviceID, TgtEntryPtr, TgtVarsPtr, TgtOffsets,
       TgtVarsSize, NumTeams, ThreadLimit, LoopTripCount);
-  Perf.Kernel.end();
+  PERF_WRAP(Perf.Kernel.end();)
   return ret;
 }
 

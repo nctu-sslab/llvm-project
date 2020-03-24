@@ -822,7 +822,8 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
     DP("Kernel execution at " DPxMOD " successful!\n", DPxPTR(tgt_entry_ptr));
   }
 
-  return OFFLOAD_SUCCESS;
+  return cudaBlocksPerGrid*cudaThreadsPerBlock;
+  //return OFFLOAD_SUCCESS;
 }
 
 int32_t __tgt_rtl_run_target_region(int32_t device_id, void *tgt_entry_ptr,

@@ -319,7 +319,7 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
       }
     }
 
-    Perf.UpdatePtr.start();
+    PERF_WRAP(Perf.UpdatePtr.start();)
     if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
           DPxPTR(Pointer_TgtPtrBegin), DPxPTR(TgtPtrBegin));
@@ -337,7 +337,7 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
           Pointer_TgtPtrBegin, TgtPtrBase};
       Device.ShadowMtx.unlock();
     }
-    Perf.UpdatePtr.end();
+    PERF_WRAP(Perf.UpdatePtr.end();)
   }
 
   return OFFLOAD_SUCCESS;
@@ -970,10 +970,11 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     rc = Device.run_region(TargetTable->EntriesBegin[TM->Index].addr,
         &tgt_args[0], &tgt_offsets[0], tgt_args.size());
   }
-  if (rc != OFFLOAD_SUCCESS) {
+  if (rc == OFFLOAD_FAIL) {
     DP ("Executing target region abort target.\n");
     return OFFLOAD_FAIL;
   }
+  PERF_WRAP(Perf.Parallelism.add(rc);)
 
   // Deallocate (first-)private arrays
   for (auto it : fpArrays) {

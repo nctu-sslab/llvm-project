@@ -19,6 +19,7 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include <set>
 #include <queue>
 
 
@@ -36,9 +37,9 @@ struct HostDataToTargetTy {
   uintptr_t HstPtrBegin;
   uintptr_t HstPtrEnd; // non-inclusive.
 
-  uintptr_t TgtPtrBegin; // target info.
+  mutable uintptr_t TgtPtrBegin; // target info.
 
-  long RefCount;
+  mutable long RefCount;
   HostDataToTargetTy()
       : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0),
         TgtPtrBegin(0), RefCount(0) {}
@@ -51,7 +52,25 @@ struct HostDataToTargetTy {
         TgtPtrBegin(TB), RefCount(RF) {}
 };
 
-typedef std::list<HostDataToTargetTy> HostDataToTargetListTy;
+struct H2DCmp {
+  // For C++14 feature
+  using is_transparent = void;
+  using KeyTy = HostDataToTargetTy;
+  // High <-              -> Low
+  bool operator()(const KeyTy& lhs, const KeyTy& rhs) const {
+    return lhs.HstPtrBegin > rhs.HstPtrBegin;
+  }
+  bool operator()(void *lhs, const KeyTy& rhs) const {
+    return (uintptr_t) lhs > rhs.HstPtrBegin;
+  }
+  bool operator()(const KeyTy& lhs, void *rhs) const {
+    return lhs.HstPtrBegin > (uintptr_t) rhs;
+  }
+
+};
+//typedef std::list<HostDataToTargetTy> HostDataToTargetListTy;
+// Make sure segments has not overlap
+typedef std::set<HostDataToTargetTy, H2DCmp> HostDataToTargetListTy;
 
 struct LookupResult {
   struct {

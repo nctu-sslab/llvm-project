@@ -29,10 +29,12 @@ int DeviceTy::associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size) {
   DataMapMtx.lock();
 
   if (IsBulkEnabled) {
-     assert(0 && "associatePtr shall not used");
+     assert(0 && "associatePtr shall not be used");
   }
   // Check if entry exists
-  for (auto &HT : HostDataToTargetMap) {
+  auto it = HostDataToTargetMap.lower_bound(HstPtrBegin);
+  if (it != HostDataToTargetMap.end()) {
+    auto &HT = *it;
     if ((uintptr_t)HstPtrBegin == HT.HstPtrBegin) {
       // Mapping already exists
       bool isValid = HT.HstPtrBegin == (uintptr_t) HstPtrBegin &&
@@ -66,7 +68,7 @@ int DeviceTy::associatePtr(void *HstPtrBegin, void *TgtPtrBegin, int64_t Size) {
       DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(newEntry.HstPtrBase),
       DPxPTR(newEntry.HstPtrBegin), DPxPTR(newEntry.HstPtrEnd),
       DPxPTR(newEntry.TgtPtrBegin));
-  HostDataToTargetMap.push_front(newEntry);
+  HostDataToTargetMap.emplace(std::move(newEntry));
 
   DataMapMtx.unlock();
 
@@ -80,8 +82,8 @@ int DeviceTy::disassociatePtr(void *HstPtrBegin) {
      assert(0 && "disassociatePtr shall not used");
   }
   // Check if entry exists
-  for (HostDataToTargetListTy::iterator ii = HostDataToTargetMap.begin();
-      ii != HostDataToTargetMap.end(); ++ii) {
+  auto ii = HostDataToTargetMap.lower_bound(HstPtrBegin);
+  if (ii != HostDataToTargetMap.end()) {
     if ((uintptr_t)HstPtrBegin == ii->HstPtrBegin) {
       // Mapping exists
       if (CONSIDERED_INF(ii->RefCount)) {
@@ -92,7 +94,6 @@ int DeviceTy::disassociatePtr(void *HstPtrBegin) {
       } else {
         DP("Trying to disassociate a pointer which was not mapped via "
             "omp_target_associate_ptr\n");
-        break;
       }
     }
   }
@@ -109,13 +110,16 @@ long DeviceTy::getMapEntryRefCnt(void *HstPtrBegin) {
   long RefCnt = -1;
 
   DataMapMtx.lock();
-  for (auto &HT : HostDataToTargetMap) {
+
+  auto it = HostDataToTargetMap.lower_bound(HstPtrBegin);
+  if (it != HostDataToTargetMap.end()) {
+    auto &HT = *it;
     if (hp >= HT.HstPtrBegin && hp < HT.HstPtrEnd) {
       DP("DeviceTy::getMapEntry: requested entry found\n");
       RefCnt = HT.RefCount;
-      break;
     }
   }
+
   DataMapMtx.unlock();
 
   if (RefCnt < 0) {
@@ -131,8 +135,11 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
 
   DP("Looking up mapping(HstPtrBegin=" DPxMOD ", Size=%ld)...\n", DPxPTR(hp),
       Size);
-  for (lr.Entry = HostDataToTargetMap.begin();
-      lr.Entry != HostDataToTargetMap.end(); ++lr.Entry) {
+
+  // Only check lower_bound and its successor
+  auto it = HostDataToTargetMap.lower_bound(HstPtrBegin);
+  for (int idx = 0; it != HostDataToTargetMap.end() && idx < 2; it++, idx++) {
+    lr.Entry = it;
     auto &HT = *lr.Entry;
     // Is it contained?
     lr.Flags.IsContained = hp >= HT.HstPtrBegin && hp < HT.HstPtrEnd &&
@@ -212,8 +219,8 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
 
-    HostDataToTargetMap.push_front(HostDataToTargetTy((uintptr_t)HstPtrBase,
-        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp));
+    HostDataToTargetMap.emplace((uintptr_t)HstPtrBase,
+        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp);
     rc = (void *)tp;
   }
 

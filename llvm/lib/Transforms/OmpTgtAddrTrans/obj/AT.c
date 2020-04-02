@@ -7,25 +7,10 @@ struct ATTableTy {
 };
 
 #pragma omp declare target
-#if 0
-// Less mul/div ALU??
-void *AddrTrans(void* addr, struct ATTableTy* table) {
-    int size = table[0].HstPtrBegin;
-    uintptr_t ret = (uintptr_t) 0;
-    uintptr_t addr_int = (intptr_t) addr;
-    for (int i = 1; i <= size; i++) {
-        if (addr_int >= table[i].HstPtrBegin && addr_int < table[i].HstPtrEnd) {
-            ret = addr_int - table[i].HstPtrBegin + table[i].TgtPtrBegin;
-            break;
-        }
-    }
-    return (void*)ret;
-}
-# else
 // Binary search version
 void *AddrTrans(void* addr, struct ATTableTy* table) {
     int size = table[0].HstPtrBegin;
-    uintptr_t ret = (uintptr_t) 0;
+    uintptr_t ret = 0;
     uintptr_t addr_int = (intptr_t) addr;
     int head = 1, end = size + 1;
     while (head < end) {
@@ -40,7 +25,15 @@ void *AddrTrans(void* addr, struct ATTableTy* table) {
             end = mid;
         }
     }
+    // Don't fault when notfound
+    if (ret == 0) {
+        for (int i = 1; i <= size; i++) {
+            if (addr_int >= table[i].HstPtrBegin && addr_int < table[i].HstPtrEnd) {
+                ret = addr_int - table[i].HstPtrBegin + table[i].TgtPtrBegin;
+                break;
+            }
+        }
+    }
     return (void*)ret;
 }
-#endif
 #pragma omp end declare target

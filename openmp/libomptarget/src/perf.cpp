@@ -23,7 +23,11 @@ void PerfEventTy::end() {
 
 void PerfEventTy::dump() {
   assert(StartCnt == 0 && "PerfEvent didn't end");
-  DP("%-11s , %7d , %10lf\n", Name.c_str(), Count, time_span.count());
+  DP("%-11s , %7d , %10lf", Name.c_str(), Count, time_span.count());
+  if (StartCnt != 0) {
+    DP(" StartCnt: %d", StartCnt);
+  }
+    DP("\n");
 }
 
 void BulkMemCount::get(int64_t device_id) {
@@ -38,11 +42,7 @@ void BulkMemCount::get(int64_t device_id) {
 // PerfRecordTy
 void PerfRecordTy::dump() {
   DP("PerfRecord dump\n");
-  Runtime.dump();
-  Kernel.dump();
-  H2DTransfer.dump();
-  D2HTransfer.dump();
-  UpdatePtr.dump();
-  TargetMem.dump();
-  Parallelism.dump();
+  for (auto p : Perfs) {
+    p->dump();
+  }
 }

@@ -475,7 +475,7 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
         return OFFLOAD_FAIL;
       }
       // create shadow pointers for this entry
-      /*
+      /* TODO
       Device.ShadowMtx.lock();
       Device.ShadowPtrMap[Pointer_HstPtrBegin] = {HstPtrBase,
           Pointer_TgtPtrBegin, TgtPtrBase};
@@ -490,6 +490,7 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
 /// Internal function to undo the mapping and retrieve the data from the device.
 int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  PERF_WRAP(Perf.RTDataEnd.start();)
   // process each input.
   for (int32_t i = arg_num - 1; i >= 0; --i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -579,18 +580,18 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
       }
 
       Device.ShadowMtx.lock();
-      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+      for (auto it = Device.ShadowPtrMap.upper_bound((void*)ub);
+      //for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
            it != Device.ShadowPtrMap.end();) {
         void **ShadowHstPtrAddr = (void**) it->first;
 
         // An STL map is sorted on its keys; use this property
         // to quickly determine when to break out of the loop.
         if ((uintptr_t) ShadowHstPtrAddr < lb) {
-          ++it;
-          continue;
-        }
-        if ((uintptr_t) ShadowHstPtrAddr >= ub)
           break;
+        }
+        /*if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;*/
 
         // If we copied the struct to the host, we need to restore the pointer.
         if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
@@ -620,7 +621,7 @@ DEL:
       }
     }
   }
-
+  PERF_WRAP(Perf.RTDataEnd.end();)
   return OFFLOAD_SUCCESS;
 }
 
@@ -658,13 +659,17 @@ int target_data_update(DeviceTy &Device, int32_t arg_num,
       uintptr_t lb = (uintptr_t) HstPtrBegin;
       uintptr_t ub = (uintptr_t) HstPtrBegin + MapSize;
       Device.ShadowMtx.lock();
-      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+      for (auto it = Device.ShadowPtrMap.upper_bound((void*)ub);
+      //for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
           it != Device.ShadowPtrMap.end(); ++it) {
         void **ShadowHstPtrAddr = (void**) it->first;
-        if ((uintptr_t) ShadowHstPtrAddr < lb)
-          continue;
+        if ((uintptr_t) ShadowHstPtrAddr < lb) {
+          break;
+        }
+        /*  continue;
         if ((uintptr_t) ShadowHstPtrAddr >= ub)
           break;
+          */
         DP("Restoring original host pointer value " DPxMOD " for host pointer "
             DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
             DPxPTR(ShadowHstPtrAddr));
@@ -684,13 +689,16 @@ int target_data_update(DeviceTy &Device, int32_t arg_num,
       uintptr_t lb = (uintptr_t) HstPtrBegin;
       uintptr_t ub = (uintptr_t) HstPtrBegin + MapSize;
       Device.ShadowMtx.lock();
-      for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
+      for (auto it = Device.ShadowPtrMap.upper_bound((void*)ub);
+      //for (ShadowPtrListTy::iterator it = Device.ShadowPtrMap.begin();
           it != Device.ShadowPtrMap.end(); ++it) {
         void **ShadowHstPtrAddr = (void**) it->first;
-        if ((uintptr_t) ShadowHstPtrAddr < lb)
-          continue;
-        if ((uintptr_t) ShadowHstPtrAddr >= ub)
+
+        if ((uintptr_t) ShadowHstPtrAddr < lb) {
           break;
+        }
+        /*if ((uintptr_t) ShadowHstPtrAddr >= ub)
+          break;*/
         DP("Restoring original target pointer value " DPxMOD " for target "
             "pointer " DPxMOD "\n", DPxPTR(it->second.TgtPtrVal),
             DPxPTR(it->second.TgtPtrAddr));

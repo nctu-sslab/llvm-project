@@ -90,7 +90,7 @@ struct ShadowPtrValTy {
   void *TgtPtrAddr;
   void *TgtPtrVal;
 };
-typedef std::map<void *, ShadowPtrValTy> ShadowPtrListTy;
+typedef std::map<void *, ShadowPtrValTy, std::greater<void*>> ShadowPtrListTy;
 
 ///
 struct PendingCtorDtorListsTy {

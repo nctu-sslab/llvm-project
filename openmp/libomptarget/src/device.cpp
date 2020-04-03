@@ -136,9 +136,23 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
   DP("Looking up mapping(HstPtrBegin=" DPxMOD ", Size=%ld)...\n", DPxPTR(hp),
       Size);
 
-  // Only check lower_bound and its successor
+  // Only check lower_bound and its pre
+  // TODO Test a case that use pre
+  // FIXME
   auto it = HostDataToTargetMap.lower_bound(HstPtrBegin);
-  for (int idx = 0; it != HostDataToTargetMap.end() && idx < 2; it++, idx++) {
+  int idx = 0;
+  if (it == HostDataToTargetMap.end()) {
+    idx ++;
+    if (it == HostDataToTargetMap.begin()) {
+      return lr;
+    }
+  }
+  if (it == HostDataToTargetMap.begin()) {
+    idx ++;
+  } else {
+    it--;
+  }
+  for (; idx < 2; it++, idx++) {
     lr.Entry = it;
     auto &HT = *lr.Entry;
     // Is it contained?

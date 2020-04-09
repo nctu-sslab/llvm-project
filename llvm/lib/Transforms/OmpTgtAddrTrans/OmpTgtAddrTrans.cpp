@@ -107,6 +107,10 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   //errs() << "OmpTgtAddrTransPass is called\n";
   module = &M;
 
+  // check omp_offload.info metadata to skip normal cuda complilation
+  if (!M.getNamedMetadata("omp_offload.info")) {
+    return FAILED;
+  }
   // Use a metadata to avoid double application
   if (M.getNamedMetadata("omptgtaddrtrans")) {
     return FAILED;
@@ -117,11 +121,13 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
     M.getOrInsertNamedMetadata("omptgtaddrtrans");
   }
 
+
   // Create TableTy
   DataLayout DL(&M);
   vector<Type*> StructMem;
   IT = IntegerType::get(M.getContext(), DL.getPointerSizeInBits());
-  for (int i = 0; i < 4; i++) {
+  int ATTableEntyNum = 3;
+  for (int i = 0; i < ATTableEntyNum; i++) {
     StructMem.push_back(IT);
   }
   ATTableType = StructType::create(M.getContext(), StructMem, "struct.ATTableTy", false);
@@ -134,6 +140,9 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   ParamTypes.push_back(ATTablePtrType);
   FunctionType *FT = FunctionType::get(AddrType, ParamTypes, false);
   ATFunction = Function::Create(FT, GlobalValue::ExternalLinkage, "AddrTrans", M);
+
+  // TODO Create storeTable func type
+  //struct ATTableTy *StoreTableShared(struct ATTableTy*, struct ATTableTy *sm, int)
 
   // Get analysis
   //MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();

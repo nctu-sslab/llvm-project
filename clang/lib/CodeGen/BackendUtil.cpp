@@ -721,15 +721,22 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
   if (TargetTriple.isNVPTX()) {
     bool DumpIR = true;
     std::error_code ec1, ec2;
-    llvm::Twine Dir("/tmp/");
-    llvm::Twine Prefix = Dir.concat(TheModule->getSourceFileName()); llvm::Twine PrellFile = Prefix.concat("PreOmpATPass.ll");
-    llvm::Twine PostllFile = Prefix.concat("PostOmpATransPass.ll");
-    static raw_fd_ostream RFO1(PrellFile.str(), ec1, sys::fs::OF_None);
-    static raw_fd_ostream RFO2(PostllFile.str(), ec2, sys::fs::OF_None);
+    std::string Prefix("/tmp/");
+    Prefix += llvm::sys::path::filename(TheModule->getSourceFileName());
+    std::string PreIRFile = Prefix + "PreOmpATPass.ll";
+    std::string PostIRFile = Prefix + "PostOmpATransPass.ll";
+    static raw_fd_ostream RFO1(PreIRFile, ec1, sys::fs::OF_None);
+    static raw_fd_ostream RFO2(PostIRFile, ec2, sys::fs::OF_None);
 
     if (ec1 || ec2) {
-      errs() << "Create raw_fd_ostream failed: " << ec1.message()
-        << ec2.message() << "Stop do createBitcodeWriterPass\n";
+      if (ec1) {
+        errs() << "Create raw_fd_ostream of " << PreIRFile << " failed\n";
+        errs() << ec1.message() << "\n";
+      }
+      if (ec2) {
+        errs() << "Create raw_fd_ostream of " << PostIRFile << " failed\n";
+        errs() << ec2.message() << "\n";
+      }
       DumpIR = false;
     }
     // Print IR before Pass

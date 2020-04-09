@@ -4173,8 +4173,19 @@ InputInfo Driver::BuildJobsForActionNoCache(
   }
 
   std::string ObjName, SrcName;
+  bool isOmpNvptx = false;
   if (JA->getKind() == Action::LinkJobClass &&
       T->getToolChain().getTriple().isNVPTX()) {
+    auto &ArgList = C.getInputArgs();
+    if (ArgList.hasArg(options::OPT_fopenmp_EQ)) {
+      isOmpNvptx = true;
+    }
+    if (ArgList.hasArg(options::OPT_fopenmp)) {
+      isOmpNvptx = true;
+    }
+  }
+
+  if (isOmpNvptx) {
     // Put prebuilt obj path into InputInfos
     // If we can get llvm src dir??
     std::string PreBuiltPath("/home/pschen/llvm/thesis/llvm-project/llvm");

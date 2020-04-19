@@ -36,4 +36,24 @@ void *AddrTrans(void* addr, struct ATTableTy* table) {
     }
     return (void*)ret;
 }
+
+// Only id 0 do this
+struct ATTableTy *StoreTableShared(struct ATTableTy* table, struct ATTableTy *sm,
+        int8_t size /* max size of table in sm */, int32_t tid) {
+    int table_size = table[0].HstPtrBegin + 1;
+    // if oversize
+    if (table_size > size) {
+        return table;
+    }
+    if (tid != 0) {
+        return sm;
+    }
+    // memcpy
+    for (int i = 0; i < table_size; i++) {
+        sm[i] = table[i];
+    }
+    return sm;
+}
+// sync to wait at return
+
 #pragma omp end declare target

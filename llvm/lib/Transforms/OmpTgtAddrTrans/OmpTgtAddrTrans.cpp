@@ -34,13 +34,23 @@ using namespace std;
 #define FAILED 1
 #define SUCCESS 0
 
+#define MAX_ATTable_SIZE 20
+
 // define LLVM_MODULE if emit llvm module
 // otherwise, visible by llvm
 //#define LLVM_MODULE
 
-
 // TODO What if it is a pointer data which will also be traced
 namespace {
+  // NOTE sync this data struct
+  struct ATTableTy {
+    uintptr_t HstPtrBegin;
+    uintptr_t HstPtrEnd;
+    uintptr_t TgtPtrBegin;
+  };
+  const int MaxATTableSize = 20;
+  const int ATTableEntyNum = sizeof(struct ATTableTy) / sizeof(uintptr_t);
+
   class OmpTgtAddrTrans : public ModulePass {
 
     typedef  map<Function*, Function*> FunctionMapTy;
@@ -49,15 +59,24 @@ namespace {
     FunctionMapTy FunctionTrans; // Functions after Transform
 
     // Types
-    IntegerType *IT;
+    // intptr_t
+    IntegerType *IT8;
+    IntegerType *IT16;
+    IntegerType *IT32;
+    IntegerType *ITptr;
+    // ATTableTy
     StructType *ATTableType;
+    // ATTableTy*
     PointerType *ATTablePtrType;
+    // void *
     PointerType *AddrType;
 
-    Function *ATFunction;
+    Function *ATFunc;
+    Function *StoreTableFunc;
 
     // llvm Module
     Module *module;
+    LLVMContext *context;
 
     // UserList per Function
     map<Function*,set<User*>> AllUserList;
@@ -84,6 +103,8 @@ namespace {
         return null_ostream;
       }
     }
+    private:
+    Argument *getFuncTableArg(Function *F);
     int8_t init(Module &M);
     Function *cloneFuncWithATArg(Function *F);
     //void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
@@ -99,6 +120,7 @@ namespace {
     unsigned getPtrDepth(Type *T);
     DominatorTree &getDomTree(Function *F);
     void getEntryFuncs(FunctionMapTy &EntryList);
+    int16_t doSharedMemOpt();
   };
 }
 
@@ -106,10 +128,12 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
 
   //errs() << "OmpTgtAddrTransPass is called\n";
   module = &M;
+  context = &M.getContext();
 
   // check omp_offload.info metadata to skip normal cuda complilation
   if (!M.getNamedMetadata("omp_offload.info")) {
-    return FAILED;
+    // FIXME
+    //return FAILED;
   }
   // Use a metadata to avoid double application
   if (M.getNamedMetadata("omptgtaddrtrans")) {
@@ -121,28 +145,41 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
     M.getOrInsertNamedMetadata("omptgtaddrtrans");
   }
 
+  DataLayout DL(&M);
+  // Init IntegerType
+  IT8 = IntegerType::get(*context, 8);
+  IT16 = IntegerType::get(*context, 16);
+  IT32 = IntegerType::get(*context, 32);
+  ITptr = IntegerType::get(*context, DL.getPointerSizeInBits());
 
   // Create TableTy
-  DataLayout DL(&M);
   vector<Type*> StructMem;
-  IT = IntegerType::get(M.getContext(), DL.getPointerSizeInBits());
-  int ATTableEntyNum = 3;
   for (int i = 0; i < ATTableEntyNum; i++) {
-    StructMem.push_back(IT);
+    StructMem.push_back(ITptr);
   }
-  ATTableType = StructType::create(M.getContext(), StructMem, "struct.ATTableTy", false);
+  ATTableType = StructType::create(*context, StructMem,
+      "struct.ATTableTy", false);
   ATTablePtrType = PointerType::getUnqual(ATTableType);
 
-  // Create function
-  AddrType = PointerType::get(IntegerType::get(M.getContext(), 8), 0);
+  // Create Address Translation function
+  AddrType = PointerType::get(IT8, 0);
   vector<Type*> ParamTypes;
   ParamTypes.push_back(AddrType);
   ParamTypes.push_back(ATTablePtrType);
-  FunctionType *FT = FunctionType::get(AddrType, ParamTypes, false);
-  ATFunction = Function::Create(FT, GlobalValue::ExternalLinkage, "AddrTrans", M);
+  FunctionType *ATFuncTy = FunctionType::get(AddrType, ParamTypes, false);
+  ATFunc = Function::Create(ATFuncTy, GlobalValue::ExternalLinkage,
+      "AddrTrans", M);
 
-  // TODO Create storeTable func type
-  //struct ATTableTy *StoreTableShared(struct ATTableTy*, struct ATTableTy *sm, int)
+  //struct ATTableTy *StoreTableShared(
+  //    struct ATTableTy*, struct ATTableTy *sm, int16_t, int32_t)
+  ParamTypes.clear();
+  ParamTypes.push_back(ATTablePtrType);
+  ParamTypes.push_back(ATTablePtrType);
+  ParamTypes.push_back(IT8);
+  ParamTypes.push_back(IT32);
+  FunctionType *STSFuncTy = FunctionType::get(ATTablePtrType, ParamTypes, false);
+  StoreTableFunc = Function::Create(STSFuncTy, GlobalValue::ExternalLinkage,
+      "StoreTableShared", M);
 
   // Get analysis
   //MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
@@ -399,20 +436,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
 // TODO Load only once for same addr
 //void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Use *PtrUse, set<User*> &UserList) {
 void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
-  Value *ATTableArg = Inst->getFunction()->arg_end() - 1;
-
-  /*
-  if (LoadInst *LI = dyn_cast<LoadInst>(Inst)) {
-    PtrAddr = LI->getPointerOperand();
-  } else if (StoreInst *SI = dyn_cast<StoreInst>(Inst)) {
-    PtrAddr = SI->getPointerOperand();
-  } else if (CallInst *CI = dyn_cast<CastInst>(Inst)) {
-    // TODO
-    PtrAddr = SI->getPointerOperand();
-  } else {
-    errs() << "insertATFuncBefore on unsupported inst\n";
-    return;
-  }*/
+  Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
 
   dp () << "insertATFuncBefore PtrAddr: " ;
   PtrAddr->print(dp());
@@ -425,7 +449,7 @@ void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<
   vector<Value*> Args;
   Args.push_back(PreCastI);
   Args.push_back(ATTableArg);
-  CallInst *CI = CallInst::Create(ATFunction->getFunctionType(), ATFunction,
+  CallInst *CI = CallInst::Create(ATFunc->getFunctionType(), ATFunc,
       Args, "TransResult", Inst);
   // insert bitcast
   CastInst *PostCastI = CastInst::Create(Instruction::BitCast, CI,
@@ -460,15 +484,11 @@ void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<
 }*/
 
 void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
-  // TODO
-  // Does these two named metadata important??
-  // !omp_offload.info
-  // !nvvm.annotations
+  // FIXME what does !omp_offload.info mean
 
   // Prepare metadata
   vector<Metadata *> PreMetaList;
-  PreMetaList.push_back(MDString::get(module->getContext(), "kernel"));
-  IntegerType *IT32 = IntegerType::get(module->getContext(), 32);
+  PreMetaList.push_back(MDString::get(*context, "kernel"));
   ConstantInt *Const = ConstantInt::get(IT32, 1, false);
   PreMetaList.push_back(ConstantAsMetadata::get(Const));
 
@@ -478,7 +498,7 @@ void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
     Function *F = E.second;
     vector<Metadata*> MetaList = PreMetaList;
     MetaList.insert(MetaList.begin(), ValueAsMetadata::get(F));
-    MDTuple *node = MDNode::get(module->getContext(), MetaList);
+    MDTuple *node = MDNode::get(*context, MetaList);
     NvvmMeta->addOperand(node);
   }
 }
@@ -495,8 +515,7 @@ CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI) {
   Function *NewCallee = FunctionTrans[Callee];
 
   // Get table Arg of parent function
-  Function *ParentFunc = CI->getFunction();
-  Argument *TableArg = (ParentFunc->arg_end() - 1);
+  Argument *TableArg = getFuncTableArg(CI->getFunction());
 
   // Get old arg
   vector<Value*> ArgsOfNew;
@@ -578,6 +597,87 @@ THIRD:
   }
 }
 
+int16_t OmpTgtAddrTrans::doSharedMemOpt() {
+  //return SUCCESS;
+  // TODO
+  // check if we should apply it
+
+  // Create shared array
+  // @_ZZ13staticReversePiiE1s =
+  //   internal addrspace(3) global [64 x i32] undef, align 4
+  //   @SMforATTablein = internal addrspace(3) global [480 x i64], align 4
+  //
+
+  // FIXME could all kernel use this space??
+  // Type : intptr * 3 * 20  = 480
+  ArrayType *SMArrayTy = ArrayType::get(ITptr, ATTableEntyNum * MaxATTableSize);
+  // TODO The linkage ok??
+  Constant *SMInit = UndefValue::get(SMArrayTy);
+  GlobalVariable *SharedMem = new GlobalVariable(*module, SMArrayTy, false,
+      GlobalValue::LinkageTypes::PrivateLinkage , SMInit, "SMforATTable",
+      nullptr, GlobalValue::ThreadLocalMode::NotThreadLocal, 3);
+  SharedMem->setAlignment(64);
+
+  Function *TidFunc = module->getFunction("llvm.nvvm.read.ptx.sreg.tid.x");
+  if (!TidFunc) {
+    dp() <<  "llvm.nvvm.read.ptx.sreg.tid.x is not found\n";
+    return FAILED;
+  }
+
+  Function *BarFunc = module->getFunction("llvm.nvvm.barrier0");
+  if (!TidFunc) {
+    dp() <<  "llvm.nvvm.barrier0 is not found\n";
+    return FAILED;
+  }
+
+  // Run from each entry
+  for (auto E : FunctionTransEntry) {
+    Function *F = E.second;
+    // NO -> Find first use of table
+    // insert AddrSpaceCast as first
+    Instruction *FirstInst = &*F->begin()->begin();
+    CastInst *SM2GenericAddr = CastInst::Create(Instruction::AddrSpaceCast,
+        SharedMem, ATTablePtrType, "SM2GenericAddr", FirstInst);
+    // Get tid reg
+    CallInst *Tid = CallInst::Create(TidFunc->getFunctionType(), TidFunc,
+        "tid", FirstInst);
+    // insert callinst
+    //struct ATTableTy *(struct ATTableTy*, struct ATTableTy *sm, int16, int32)
+    vector<Value*> StoreTableCallArgs;
+    StoreTableCallArgs.push_back(getFuncTableArg(F));
+    StoreTableCallArgs.push_back(SM2GenericAddr);
+    StoreTableCallArgs.push_back(ConstantInt::get(IT8, MaxATTableSize, false));
+    StoreTableCallArgs.push_back(Tid);
+    CallInst *NewTableAddr = CallInst::Create(StoreTableFunc->getFunctionType(),
+       StoreTableFunc, StoreTableCallArgs, "NewTableAddr", FirstInst);
+    // replace use
+    vector<Use*> UseToReplace;
+    for (auto &U : getFuncTableArg(F)->uses()) {
+      // Except the NewTableAddr call
+      if (U.getUser() == dyn_cast<User>(NewTableAddr)) {
+        continue;
+      }
+      UseToReplace.push_back(&U);
+    }
+    for (auto U : UseToReplace) {
+      U->set(NewTableAddr);
+    }
+    // barrier
+    CallInst::Create(BarFunc->getFunctionType(), BarFunc,
+        "", FirstInst);
+  }
+  return SUCCESS;
+}
+
+Argument *OmpTgtAddrTrans::getFuncTableArg(Function *F) {
+  // Check name
+  assert(F->getName().endswith("_AT"));
+  Argument *ATTableArg = F->arg_end() - 1;
+  // Check type
+  assert(ATTablePtrType == ATTableArg->getType());
+  return ATTableArg;
+}
+
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
   bool changed = false;
 
@@ -591,6 +691,7 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   if (FunctionTransEntry.size()) {
     changed = true;
   } else {
+    dp() << "No entry function(kernel\n";
     return changed;
   }
 
@@ -613,6 +714,9 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
       }
     }
   }
+
+  doSharedMemOpt();
+  dp() << "OmpTgtAddrTransPass done\n";
 
   return changed;
 }

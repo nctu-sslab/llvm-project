@@ -560,6 +560,7 @@ void DeviceTy::table_transfer() {
     SegmentList.TgtMemSize = NewSize;
   }
   data_submit(SegmentList.TgtMemPtr, &table[0],table_size);
+  PERF_WRAP(Perf.ATTableSize.add(table.size());)
   DP2("Transfered AT table\n");
 }
 

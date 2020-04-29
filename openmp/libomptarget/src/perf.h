@@ -1,4 +1,5 @@
 #ifndef _OMPTARGET_PERF_H_
+#define _OMPTARGET_PERF_H_
 #include <string>
 #include <omptarget.h>
 #include <chrono>
@@ -19,22 +20,29 @@ using namespace std;
 using namespace std::chrono;
 
 struct PerfBaseTy {
+  string Name;
   int func();
   virtual void dump() {};
-};
-
-struct PerfEventTy : public PerfBaseTy {
-  string Name;
-  float Time; // elapsed time in sec
-  int Count;
-  int StartCnt;
-  high_resolution_clock::time_point StartTime;
-  duration<double> time_span;
-
-  PerfEventTy(): Time(0), Count(0), StartCnt(0) {};
   struct PerfBaseTy *setName(string str) {
     Name = str;
     return this;
+  };
+};
+
+struct PerfEventTy : public PerfBaseTy {
+  float Time; // elapsed time in sec
+  int Count;
+  int StartCnt;
+  bool Lock;
+  PerfEventTy *LockTarget;
+
+  high_resolution_clock::time_point StartTime;
+  duration<double> time_span;
+
+  PerfEventTy(): Time(0), Count(0), StartCnt(0),
+      Lock(false), LockTarget(NULL) {};
+  void setLockTarget(PerfEventTy *target) {
+    LockTarget = target;
   };
   void start();
   void end();
@@ -42,37 +50,20 @@ struct PerfEventTy : public PerfBaseTy {
 };
 
 // Try to get bulk alloc size
-template <typename T>struct PerfCountTy : public PerfBaseTy {
-  T Sum;
+struct PerfCountTy : public PerfBaseTy {
+  unsigned long Sum;
   int Count;
-  string Name;
-  void add(T count) {
+  void add(unsigned long count) {
     Sum += count;
     Count++;
   }
   void dump() {
-    char units[5] = {'B', 'K', 'M', 'G', 'X'};
-    int units_idx = 0;
-    double n = Sum;
-
-    while (n > 1000) {
-      n /= 1000;
-      units_idx++;
-    }
-    if (units_idx > 4) {
-      units_idx = 5;
-    }
-    cerr << std::left << setw(11) << Name << " , " << std::right <<
-      setw(7) << Count << " , " << setw(10) <<  n << units[units_idx] << "\n";
+    fprintf(stderr, "%-11s , %7d , %10lu\n", Name.c_str(), Count, Sum);
   }
   PerfCountTy(): Count(0), Sum(0) {}
-  struct PerfBaseTy *setName(string str) {
-    Name = str;
-    return this;
-  };
 };
 
-struct BulkMemCount : public PerfCountTy<long> {
+struct BulkMemCount : public PerfCountTy {
   using PerfCountTy::PerfCountTy;
   void get(int64_t device_id);
 };
@@ -91,7 +82,8 @@ struct PerfRecordTy {
   PerfEventTy RTDataEnd;
   PerfEventTy RTTarget;
 
-  PerfCountTy<long> Parallelism;
+  PerfCountTy Parallelism;
+  PerfCountTy ATTableSize;
 
   BulkMemCount TargetMem;
 
@@ -110,8 +102,10 @@ struct PerfRecordTy {
     SET_PERF_NAME(RTDataEnd);
 
     SET_PERF_NAME(Parallelism);
+    SET_PERF_NAME(ATTableSize);
     SET_PERF_NAME(TargetMem);
 #undef SET_PERF_NAME
+    UpdatePtr.setLockTarget(&H2DTransfer);
   };
   void dump();
   void init() {Enabled = true;}

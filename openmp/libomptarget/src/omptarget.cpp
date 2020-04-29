@@ -22,6 +22,7 @@
 
 #include "perf.h"
 #include "at.h"
+#include "rttype.h"
 
 #ifdef OMPTARGET_DEBUG
 int DebugLevel = 0;
@@ -219,6 +220,10 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
     return bulk_target_data_begin(Device, arg_num,
         args_base, args, arg_sizes, arg_types);
   }
+  void *HstPtrBegin, *HstPtrBase;
+  int64_t data_size, data_type;
+
+  RttTy rtt(args + arg_num, arg_sizes + arg_num);
   // process each input.
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -226,15 +231,42 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE))
       continue;
 
-    void *HstPtrBegin = args[i];
-    void *HstPtrBase = args_base[i];
-    int64_t data_size = arg_sizes[i];
+    HstPtrBegin = args[i];
+    HstPtrBase = args_base[i];
+    data_size = arg_sizes[i];
+    data_type = arg_types[i];
 
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      DP2("OMP_TGT_MAPTYPE_NESTED\n");
+      // init Rtt with stack addr
+      int ret = rtt.init(&HstPtrBegin, &HstPtrBase, &data_size, &data_type);
+      if (ret != RTT_SUCCESS) {
+        DP2("RTT init failed");
+        continue;
+      }
+    }
+
+DCGEN_REPEAT:
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      // Regen Begin, Base, size maptype
+      int ret = rtt.computeRegion();
+      if (ret == RTT_END) {
+        continue;
+      }
+      if (ret != RTT_SUCCESS) {
+        return OFFLOAD_FAIL;
+      }
+    }
+    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      //goto DCGEN_REPEAT;
+    }
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
     int64_t padding = 0;
     const int next_i = i+1;
+    // FIXME rtt
     if (member_of(arg_types[i]) < 0 && next_i < arg_num &&
         member_of(arg_types[next_i]) == i) {
       padding = (int64_t)HstPtrBegin % alignment;
@@ -249,14 +281,14 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
     // Address of pointer on the host and device, respectively.
     void *Pointer_HstPtrBegin, *Pointer_TgtPtrBegin;
     bool IsNew, Pointer_IsNew;
-    bool IsImplicit = arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT;
+    bool IsImplicit = data_type & OMP_TGT_MAPTYPE_IMPLICIT;
     // UpdateRef is based on MEMBER_OF instead of TARGET_PARAM because if we
     // have reached this point via __tgt_target_data_begin and not __tgt_target
     // then no argument is marked as TARGET_PARAM ("omp target data map" is not
     // associated with a target region, so there are no target parameters). This
     // may be considered a hack, we could revise the scheme in the future.
-    bool UpdateRef = !(arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF);
-    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+    bool UpdateRef = !(data_type & OMP_TGT_MAPTYPE_MEMBER_OF);
+    if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       DP("Has a pointer entry: \n");
       // base is address of pointer.
       Pointer_TgtPtrBegin = Device.getOrAllocTgtPtr(HstPtrBase, HstPtrBase,
@@ -287,20 +319,22 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
         " - is%s new\n", data_size, DPxPTR(TgtPtrBegin),
         (IsNew ? "" : " not"));
 
-    if (arg_types[i] & OMP_TGT_MAPTYPE_RETURN_PARAM) {
+    if (data_type & OMP_TGT_MAPTYPE_RETURN_PARAM) {
       uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)HstPtrBase;
       void *TgtPtrBase = (void *)((uintptr_t)TgtPtrBegin - Delta);
       DP("Returning device pointer " DPxMOD "\n", DPxPTR(TgtPtrBase));
+      // FIXME rtt ?
       args_base[i] = TgtPtrBase;
     }
 
-    if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+    if (data_type & OMP_TGT_MAPTYPE_TO) {
       bool copy = false;
-      if (IsNew || (arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS)) {
+      if (IsNew || (data_type & OMP_TGT_MAPTYPE_ALWAYS)) {
         copy = true;
-      } else if (arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) {
+      } else if (data_type & OMP_TGT_MAPTYPE_MEMBER_OF) {
         // Copy data only if the "parent" struct has RefCount==1.
-        int32_t parent_idx = member_of(arg_types[i]);
+        // FIXME rtt
+        int32_t parent_idx = member_of(data_type);
         long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
         assert(parent_rc > 0 && "parent struct not found");
         if (parent_rc == 1) {
@@ -320,7 +354,7 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
     }
 
     PERF_WRAP(Perf.UpdatePtr.start();)
-    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+    if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
           DPxPTR(Pointer_TgtPtrBegin), DPxPTR(TgtPtrBegin));
       uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
@@ -338,6 +372,10 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
       Device.ShadowMtx.unlock();
     }
     PERF_WRAP(Perf.UpdatePtr.end();)
+
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      goto DCGEN_REPEAT;
+    }
   }
 
   return OFFLOAD_SUCCESS;
@@ -492,6 +530,9 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     void **args, int64_t *arg_sizes, int64_t *arg_types) {
   PERF_WRAP(Perf.RTDataEnd.start();)
   // process each input.
+
+  RttTy rtt(args + arg_num, arg_sizes + arg_num);
+
   for (int32_t i = arg_num - 1; i >= 0; --i) {
     // Ignore private variables and arrays - there is no mapping for them.
     // Also, ignore the use_device_ptr directive, it has no effect here.
@@ -499,8 +540,36 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE))
       continue;
 
+    //void *HstPtrBegin = args[i];
+    //int64_t data_size = arg_sizes[i];
+
     void *HstPtrBegin = args[i];
+    void *HstPtrBase = args_base[i];
     int64_t data_size = arg_sizes[i];
+    int64_t data_type = arg_types[i];
+
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      DP2("OMP_TGT_MAPTYPE_NESTED\n");
+      // init Rtt with stack addr
+      int ret = rtt.init(&HstPtrBegin, &HstPtrBase, &data_size, &data_type);
+      if (ret != RTT_SUCCESS) {
+        DP2("RTT init failed");
+        continue;
+      }
+    }
+
+DCGEN_REPEAT:
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      // Regen Begin, Base, size maptype
+      int ret = rtt.computeRegion();
+      if (ret == RTT_END) {
+        continue;
+      }
+      if (ret != RTT_SUCCESS) {
+        return OFFLOAD_FAIL;
+      }
+    }
+    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
@@ -518,9 +587,9 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     }
 
     bool IsLast;
-    bool UpdateRef = !(arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) ||
-        (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ);
-    bool ForceDelete = arg_types[i] & OMP_TGT_MAPTYPE_DELETE;
+    bool UpdateRef = !(data_type & OMP_TGT_MAPTYPE_MEMBER_OF) ||
+        (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ);
+    bool ForceDelete = data_type & OMP_TGT_MAPTYPE_DELETE;
 
     // If PTR_AND_OBJ, HstPtrBegin is address of pointee
     void *TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, data_size, IsLast,
@@ -535,21 +604,21 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
 
     bool DelEntry = IsLast || ForceDelete;
 
-    if ((arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) &&
-        !(arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ)) {
+    if ((data_type & OMP_TGT_MAPTYPE_MEMBER_OF) &&
+        !(data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ)) {
       DelEntry = false; // protect parent struct from being deallocated
     }
 
-    if ((arg_types[i] & OMP_TGT_MAPTYPE_FROM) || DelEntry) {
+    if ((data_type & OMP_TGT_MAPTYPE_FROM) || DelEntry) {
       // Move data back to the host
-      if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
-        bool Always = arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS;
+      if (data_type & OMP_TGT_MAPTYPE_FROM) {
+        bool Always = data_type & OMP_TGT_MAPTYPE_ALWAYS;
         //Always = true;
         bool CopyMember = false;
-        if ((arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) &&
-            !(arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ)) {
+        if ((data_type & OMP_TGT_MAPTYPE_MEMBER_OF) &&
+            !(data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ)) {
           // Copy data only if the "parent" struct has RefCount==1.
-          int32_t parent_idx = member_of(arg_types[i]);
+          int32_t parent_idx = member_of(data_type);
           long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
           assert(parent_rc > 0 && "parent struct not found");
           if (parent_rc == 1) {
@@ -594,7 +663,7 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
           break;*/
 
         // If we copied the struct to the host, we need to restore the pointer.
-        if (arg_types[i] & OMP_TGT_MAPTYPE_FROM) {
+        if (data_type & OMP_TGT_MAPTYPE_FROM) {
           DP("Restoring original host pointer value " DPxMOD " for host "
               "pointer " DPxMOD "\n", DPxPTR(it->second.HstPtrVal),
               DPxPTR(ShadowHstPtrAddr));
@@ -619,6 +688,9 @@ DEL:
           return OFFLOAD_FAIL;
         }
       }
+    }
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      goto DCGEN_REPEAT;
     }
   }
   PERF_WRAP(Perf.RTDataEnd.end();)

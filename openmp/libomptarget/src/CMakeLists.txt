@@ -21,6 +21,7 @@ set(src_files
   at.cpp
   segment.cpp
   perf.cpp
+  rttype.cpp
 )
 
 # Build libomptarget library with libdl dependency.

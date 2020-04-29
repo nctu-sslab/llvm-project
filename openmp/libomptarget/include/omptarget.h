@@ -62,6 +62,8 @@ enum tgt_map_type {
   OMP_TGT_MAPTYPE_LITERAL         = 0x100,
   // mapping is implicit
   OMP_TGT_MAPTYPE_IMPLICIT        = 0x200,
+  // deep copy mapping
+  OMP_TGT_MAPTYPE_NESTED          = 0x400,
   // member of struct, member given by [16 MSBs] - 1
   OMP_TGT_MAPTYPE_MEMBER_OF       = 0xffff000000000000
 };

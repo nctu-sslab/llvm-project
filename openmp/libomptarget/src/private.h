@@ -14,10 +14,10 @@
 #define _OMPTARGET_PRIVATE_H
 
 #include <omptarget.h>
-
 #include <cstdint>
+#include "device.h"
 
-extern int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
+static int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types);
 
 extern int target_data_begin(DeviceTy &Device, int32_t arg_num,
@@ -91,11 +91,10 @@ extern int DebugLevel2;
     } \
   } while (false)
 
-#define PFs() DP2("Function %s start\n", __func__)
-#define PFe() DP2("Function %s end\n", __func__)
 
 #else // OMPTARGET_DEBUG
 #define DP(...) {}
+#define DP2(...) {}
 #endif // OMPTARGET_DEBUG
 
 #endif

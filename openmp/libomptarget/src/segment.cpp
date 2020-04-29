@@ -8,6 +8,7 @@ void SegmentTy::dump() {
 
 std::string SegmentTy::getString() {
   char buf[120];
+#ifdef OMPTARGET_DEBUG
   uintptr_t size = HstPtrEnd - HstPtrBegin;
   if (TgtPtrBegin) {
     sprintf(buf, "[" DPxMOD ":" DPxMOD "->" DPxMOD "<%" PRIuPTR ">]",
@@ -16,5 +17,6 @@ std::string SegmentTy::getString() {
     sprintf(buf, "[" DPxMOD ":" DPxMOD "<%" PRIuPTR ">]",
         DPxPTR(HstPtrBegin), DPxPTR(HstPtrEnd), size);
   }
+#endif
   return std::string(buf);
 }

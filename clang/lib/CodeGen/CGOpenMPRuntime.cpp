@@ -18,8 +18,10 @@
 #include "clang/CodeGen/ConstantInitBuilder.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/StmtOpenMP.h"
-#include "clang/Basic/BitmaskEnum.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Basic/BitmaskEnum.h"
+#include "clang/Basic/SourceLocation.h"
+#include "clang/Lex/Lexer.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -27,7 +29,6 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
-#include "../../../openmp/libomptarget/src/rttype.h"
 #include <cassert>
 
 using namespace clang;
@@ -35,20 +36,13 @@ using namespace CodeGen;
 
 namespace {
 class MappableExprsHandler;
-//LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
-// Put this under first global LLVM_MARK_AS_BITMASK_ENUM
-// RttTypes is the first byte of uint64_t
-/*enum RttTypes : uint64_t {
- * Defined in rttype.h
-  RTT_ADDR_SLOT     = 0x00,
+enum RttTypes : uint64_t {
   RTT_BUILTIN       = 0x01,
   RTT_PTR           = 0x02,
   RTT_STRUCT        = 0x2UL << 60,
   RTT_TID           = 0x4UL << 60,
-  RTT_TYPE_ADDR     = 0x8UL << 60, // next uint64_t is the pointer
-//  LLVM_MARK_AS_BITMASK_ENUM(RTT_NONE),
 };
-*/
+
 class MapRttArrayTy : public SmallVector<uint64_t, 4> {
   public :
   llvm::GlobalVariable *IR = nullptr;
@@ -157,9 +151,10 @@ class OMPDC_Helper : public RecursiveASTVisitor<OMPDC_Helper> {
 
   // Stmt
   int OASECount;
-  int getOASECount(Expr *E) {
+  int getOASECount(const Expr *E) {
+    Expr *expr = const_cast<Expr*>(E);
     OASECount = 0;
-    TraverseStmt(E);
+    TraverseStmt(expr);
     return OASECount;
   }
   bool VisitOMPArraySectionExpr(OMPArraySectionExpr *OASE) {
@@ -7223,6 +7218,8 @@ public:
     OMP_MAP_IMPLICIT = 0x200,
 #ifndef NO_OMP_DC
     OMP_MAP_NESTED = 0x400,
+    // If a flags has OMP_MAP_NESTED, embed every flags
+    OMP_MAP_HAS_NESTED = 0x800,
 #endif
     /// The 16 MSBs of the flags indicate whether the entry is member of some
     /// struct/class.
@@ -7400,8 +7397,8 @@ private:
     return getDeepCopyExpressionCount(E) > 1;
   }
   int getDeepCopyExpressionCount(const Expr *E) const {
-    OMPDC_Helper DCHepler;
-    return DCHepler.getOASECount(const_cast<Expr*>(E));
+    OMPDC_Helper DCHelper;
+    return DCHelper.getOASECount(E);
   }
 #endif
   /// Return true if the provided expression is a final array section. A
@@ -7698,13 +7695,6 @@ private:
     // whether we are dealing with a member of a declared struct.
     const MemberExpr *EncounteredME = nullptr;
 
-
-    llvm::outs() << "Components size: " << Components.size() << "\n";
-    if (auto AE = Components.begin()->getAssociatedExpression()) {
-      llvm::outs() << "Root Expr:\n";
-      AE->dump();
-    }
-
     for (; I != CE; ++I) {
       // If the current component is member of a struct (parent struct) mark it.
       if (!EncounteredME) {
@@ -7863,7 +7853,7 @@ private:
 #ifndef NO_OMP_DC
           if (IsDeepCopyExpression) {
             Flags |=  OMP_MAP_NESTED;
-            llvm::outs() << "Add nested flag" << llvm::format_hex(Flags, 18) << "\n";
+            //llvm::outs() << "Add nested flag" << llvm::format_hex(Flags, 18) << "\n";
           }
 #endif
           Types.push_back(Flags);
@@ -7891,42 +7881,49 @@ private:
 #ifndef NO_OMP_DC
         // IsFinalArraySection is true
         if (IsDeepCopyExpression) {
-          OMPDC_Helper DCHepler;
-          llvm::outs() << "Dealing with deep copy expression\n";
-          // TODO gen the rest for DC expression
+          if (auto AE = Components.begin()->getAssociatedExpression()) {
+            llvm::errs() << "DC Expr: ";
+            bool Invalid = false;
+            auto &ctx = CGF.getContext();
+            StringRef ExprSrc = Lexer::getSourceText(
+                CharSourceRange::getTokenRange(AE->getSourceRange()),
+                ctx.getSourceManager(), ctx.getLangOpts(), &Invalid);
+            if (!Invalid) {
+              llvm::errs() << ExprSrc << "\n";
+            }
+          }
+          llvm::outs() << "\tComponents size: " << Components.size() << "\n";
+          OMPDC_Helper DCHelper;
 
-          //int Count = getDeepCopyExpressionCount(I->getAssociatedExpression());
           Expr *E = I->getAssociatedExpression();
           assert(isa<OMPArraySectionExpr>(E));
           if (auto OASE = dyn_cast<OMPArraySectionExpr>(E)) {
             QualType TargetType = OASE->getBase()->getType()
               .getCanonicalType();
             // Gen type
-            llvm::outs() << "This is the mapping type:\n";
-            TargetType->dump();
-            auto ID = DCHepler.genRttTypes(TargetType);
-            llvm::GlobalVariable *GV = DCHepler.emitRttArrayy(ID, CGF.CGM);
-            llvm::outs() << "Get Type ID: " << ID << "\n";
-            llvm::outs() << "Print Types: ";
-            for (auto M : DCHepler.getRttArrayByID(ID)) {
-              llvm::outs() << llvm::format_hex(M, 18) << " ";
+            llvm::outs() << "\tMapping type: " <<
+              TargetType.getAsString() << "\n";
+            auto ID = DCHelper.genRttTypes(TargetType);
+            llvm::GlobalVariable *GV = DCHelper.emitRttArrayy(ID, CGF.CGM);
+            llvm::outs() << "\tRTT array: ";
+            for (auto M : DCHelper.getRttArrayByID(ID)) {
+              llvm::outs().write_hex(M);
+              llvm::outs() << " ";
             }
-            DCHepler.AdditionalPointers.push_back(GV);
-
-            // Push FinalArraySection size
-            DCHepler.AdditionalSizes.push_back(
-              CGF.Builder.CreateIntCast(Size, CGF.Int64Ty, /*isSigned=*/true));
+            llvm::outs() << "\n";
+            DCHelper.AdditionalPointers.push_back(GV);
           } else {
             assert(0 && "IsFinalArraySection is not a OMPArraySectionExpr");
           }
 
           // Gen for rest of then
+          // TODO push 1 if there is a pointer
           for (; I != CE; ++I) {
             // append to sizes
             Expr *E = I->getAssociatedExpression();
             if (OMPArraySectionExpr *OASE = dyn_cast<OMPArraySectionExpr>(E)) {
               llvm::Value *Size = getExprTypeSize(OASE);
-              DCHepler.AdditionalSizes.push_back(
+              DCHelper.AdditionalSizes.push_back(
                 CGF.Builder.CreateIntCast(Size, CGF.Int64Ty, /*isSigned=*/true));
             }
           }
@@ -8673,13 +8670,19 @@ emitOffloadingArrays(CodeGenFunction &CGF,
   Info.NumberOfPtrs = BasePointers.size();
 #ifndef NO_OMP_DC
   // append addtional
-  // TODO
-  OMPDC_Helper dc;
-  Pointers.append(dc.AdditionalPointers.begin(), dc.AdditionalPointers.end());
-  Sizes.append(dc.AdditionalSizes.begin(), dc.AdditionalSizes.end());
-  dc.AdditionalPointers.clear();
-  dc.AdditionalSizes.clear();
-  // Put addtional  size and ptr here
+  OMPDC_Helper DCHelper;
+  if (DCHelper.AdditionalPointers.size() > 0) {
+    // put OMP_MAP_HAS_NESTED to every flag
+    for (auto &Flag : MapTypes) {
+      //llvm::errs() << "Add OMP_MAP_HAS_NESTED\n";
+      Flag |= MappableExprsHandler::OMP_MAP_HAS_NESTED;
+    }
+  }
+  Pointers.append(DCHelper.AdditionalPointers.begin(), DCHelper.AdditionalPointers.end());
+  Sizes.append(DCHelper.AdditionalSizes.begin(), DCHelper.AdditionalSizes.end());
+  DCHelper.AdditionalPointers.clear();
+  DCHelper.AdditionalSizes.clear();
+  // Put addtional size and ptr here
   Info.NumberOfSizes = Sizes.size();
   Info.NumberOfPtrsWithAppend = Pointers.size();
 #endif
@@ -8690,7 +8693,6 @@ emitOffloadingArrays(CodeGenFunction &CGF,
     bool hasRuntimeEvaluationCaptureSize = false;
     for (llvm::Value *S : Sizes)
       if (!isa<llvm::Constant>(S)) {
-        llvm::outs() << "hasRuntimeEvaluationCaptureSize\n";
         hasRuntimeEvaluationCaptureSize = true;
         break;
       }

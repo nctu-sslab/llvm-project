@@ -1,0 +1,47 @@
+172c172
+< float dist(float *p1, float *p2, int dim) {
+---
+> float dist(Point p1, Point p2, int dim) {
+176c176
+<         result += (p1[i] - p2[i]) * (p1[i] - p2[i]);
+---
+>         result += (p1.coord[i] - p2.coord[i]) * (p1.coord[i] - p2.coord[i]);
+221c221
+<         float distance = dist(points->p[k].coord, points->p[0].coord, points->dim);
+---
+>         float distance = dist(points->p[k], points->p[0], points->dim);
+243c243
+<                 float distance = dist(points->p[i].coord, points->p[k].coord, points->dim);
+---
+>                 float distance = dist(points->p[i], points->p[k], points->dim);
+271c271
+<                         dist(points->p[i].coord, points->p[k].coord, points->dim);
+---
+>                         dist(points->p[i], points->p[k], points->dim);
+463d462
+<         float *gl_coord = points->p[0].coord;
+465c464
+<             dist(gl_coord + i * points->dim, gl_coord + x * points->dim, points->dim) * points->p[i].weight;
+---
+>             dist(points->p[i], points->p[x], points->dim) * points->p[i].weight;
+563d561
+<             float *gl_coord = points->p[0].coord;
+570c568
+<                     dist(gl_coord + i * points->dim, gl_coord + x * points->dim, points->dim);
+---
+>                     dist(points->p[i], points->p[x], points->dim);
+783c781
+<         myhiz += dist(points->p[kk].coord, points->p[0].coord, ptDimension) *
+---
+>         myhiz += dist(points->p[kk], points->p[0], ptDimension) *
+871d868
+<     //FIXME support struct nested
+874c871,876
+< #pragma omp target enter data map(always, to: points->p[0].coord[:points->num*points->dim])
+---
+>     for (int i = 0; i < points->num; i++) {
+> #pragma omp target enter data map(always, to: points->p[i].coord[:points->dim])
+>     }
+> // TODO Map the bulk
+> //#pragma omp target enter data map(to: points->p[0].coord[:points->num*points->dim])
+> //#pragma omp target enter data map(to: points->p[i].coord[:1])

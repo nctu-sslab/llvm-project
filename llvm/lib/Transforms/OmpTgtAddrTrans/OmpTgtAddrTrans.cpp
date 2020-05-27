@@ -98,7 +98,7 @@ namespace {
       assert(!EC);
       static char IsDP =(bool) getenv("DP2");
       if (IsDP) {
-        return errs();
+        return errs(); // llvm::errs()
       } else {
         return null_ostream;
       }
@@ -591,7 +591,12 @@ THIRD:
     if (auto *CAM = dyn_cast<ConstantAsMetadata>(MD->getOperand(2).get())) {
       if (CAM->getValue()->isOneValue()) {
         EntryList[Entry] = NULL;
-        dp() << "Get entry Func: " << Entry->getName() << "\n";
+        dp() << "Entry Function: " << Entry->getName() << "(";
+        for (auto &arg : Entry->args()) {
+          arg.getType()->print(dp(),true, false);
+          dp() << " " << arg.getName() << ", ";
+        }
+        dp() << ")\n";
       }
     }
   }
@@ -610,8 +615,8 @@ int16_t OmpTgtAddrTrans::doSharedMemOpt() {
 
   // FIXME could all kernel use this space??
   // Type : intptr * 3 * 20  = 480
+  //
   ArrayType *SMArrayTy = ArrayType::get(ITptr, ATTableEntyNum * MaxATTableSize);
-  // TODO The linkage ok??
   Constant *SMInit = UndefValue::get(SMArrayTy);
   GlobalVariable *SharedMem = new GlobalVariable(*module, SMArrayTy, false,
       GlobalValue::LinkageTypes::PrivateLinkage , SMInit, "SMforATTable",
@@ -716,7 +721,7 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   }
 
   doSharedMemOpt();
-  dp() << "OmpTgtAddrTransPass done\n";
+  dp() << "OmpTgtAddrTransPass Finished\n";
 
   return changed;
 }

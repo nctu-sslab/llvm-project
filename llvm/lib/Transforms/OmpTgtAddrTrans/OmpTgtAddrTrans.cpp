@@ -4,6 +4,7 @@
 //===----------------------------------------------------------------------===//
 #include <map>
 #include <queue>
+#include <unordered_set>
 
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/Statistic.h"
@@ -23,6 +24,11 @@
 using namespace llvm;
 using namespace std;
 
+/*
+ * TODO
+ * Reuse translate result???
+ */
+
 #ifdef DEBUG
 #define DB(STMT) STMT
 #else
@@ -39,6 +45,19 @@ using namespace std;
 // define LLVM_MODULE if emit llvm module
 // otherwise, visible by llvm
 //#define LLVM_MODULE
+
+bool IsDebug = false;
+
+raw_ostream &dp() {
+  std::error_code  EC;
+  static raw_fd_ostream null_ostream("/dev/null", EC, sys::fs::OF_None);
+  assert(!EC);
+  if (IsDebug) {
+    return errs(); // llvm::errs()
+  } else {
+    return null_ostream;
+  }
+}
 
 // TODO What if it is a pointer data which will also be traced
 namespace {
@@ -92,22 +111,11 @@ namespace {
       llvm::initializeOmpTgtAddrTransPass(*PassRegistry::getPassRegistry());
 #endif
     }
-    raw_ostream &dp() {
-      std::error_code  EC;
-      static raw_fd_ostream null_ostream("/dev/null", EC, sys::fs::OF_None);
-      assert(!EC);
-      static char IsDP =(bool) getenv("DP2");
-      if (IsDP) {
-        return errs(); // llvm::errs()
-      } else {
-        return null_ostream;
-      }
-    }
     private:
     Argument *getFuncTableArg(Function *F);
     int8_t init(Module &M);
     Function *cloneFuncWithATArg(Function *F);
-    //void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
+    void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
     void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs);
     CallInst *swapCallInst(CallInst *CI);
     void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
@@ -116,8 +124,12 @@ namespace {
     void traceArgInFunc(Function *, Argument*);
     bool isATFunction(Function *Func);
     void insertATFuncBefore(Instruction *I, Value *Ptr, set<User*> &UserList);
-    unsigned getPtrDepth(Value *V);
+
     unsigned getPtrDepth(Type *T);
+    bool typeContainPtr(Type *T);
+    bool isArgNeedAT(Argument *A);
+    bool mayContainHostPtr(Value *V);
+
     DominatorTree &getDomTree(Function *F);
     void getEntryFuncs(FunctionMapTy &EntryList);
     int16_t doSharedMemOpt();
@@ -132,7 +144,7 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
 
   // check omp_offload.info metadata to skip normal cuda complilation
   if (!M.getNamedMetadata("omp_offload.info")) {
-    // FIXME
+    // TODO
     //return FAILED;
   }
   // Use a metadata to avoid double application
@@ -197,8 +209,12 @@ bool OmpTgtAddrTrans::isATFunction(Function *Func) {
   return false;
 }
 
-unsigned OmpTgtAddrTrans::getPtrDepth(Value *V) {
+/*unsigned OmpTgtAddrTrans::getPtrDepth(Value *V) {
   return getPtrDepth(V->getType());
+}*/
+
+bool OmpTgtAddrTrans::isArgNeedAT(Argument *A) {
+  return mayContainHostPtr(A);
 }
 
 unsigned OmpTgtAddrTrans::getPtrDepth(Type *T) {
@@ -209,6 +225,31 @@ unsigned OmpTgtAddrTrans::getPtrDepth(Type *T) {
   }
   return depth;
 }
+bool OmpTgtAddrTrans::typeContainPtr(Type *T) {
+  unsigned depth = getPtrDepth(T);
+  if (depth > 0) {
+    return true;
+  }
+  // Deal with struct
+  if (StructType *ST = dyn_cast<StructType>(T)) {
+    for (auto element : ST->elements()) {
+      if (typeContainPtr(element)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool OmpTgtAddrTrans::mayContainHostPtr(Value *V) {
+  // This must be a pointer
+  Type *T = V->getType();
+  if (PointerType *PT = dyn_cast<PointerType>(T)) {
+    return typeContainPtr(PT->getElementType());
+  }
+  return false;
+}
+
 // Param
 // TODO kernel need to have some attribute nvvm annotation
 Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
@@ -251,22 +292,32 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
   return NewFunc;
 }
 
+std::unordered_set<Argument*> TracedArgs;
 // Arg is CPU addr, keep trace it and insert AT function
 void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
-  // FIXME Possible that pointer to pointer is all GPU addr
+  // TODO Possible that pointer to pointer is also GPU addr
+  if (TracedArgs.find(Arg) != TracedArgs.end()) {
+    return ;
+  }
+  TracedArgs.insert(Arg);
   struct PtrInfo {
     Value *V;
-    unsigned PtrDepth;
+    //unsigned PtrDepth;
+    unsigned DevicePtrDepth;
     Instruction *UseAfter;
+    /*
     PtrInfo(Value *V, unsigned D): V(V), PtrDepth(D), UseAfter(NULL) {};
     PtrInfo(Value *V, unsigned D, Instruction *I): V(V), PtrDepth(D),
+      UseAfter(I) {};
+      */
+    PtrInfo(Value *V, unsigned D): V(V), DevicePtrDepth(D), UseAfter(NULL) {};
+    PtrInfo(Value *V, unsigned D, Instruction *I): V(V), DevicePtrDepth(D),
       UseAfter(I) {};
   };
   //queue<pair<Value*, unsigned>> Vals;
   queue<PtrInfo> Vals;
   // TODO test per-function List
 
-  unsigned ArgDepth = getPtrDepth(Arg);
 
   set<User*> &UserList = AllUserList[Func];
 
@@ -275,27 +326,37 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
     Func->getFunctionType()->dump();
     return;
   }
-  dp() << "traceArgInFunc: " << Func->getName() <<  " PtrDepth: "<< ArgDepth;
+  dp() << "\nTrace arg: ";
   Arg->print(dp());
-  dp() << "\n";
+  dp() << " In Function: " << Func->getName() << "\n";
 
-  Vals.push({Arg, getPtrDepth(Arg)});
+  Vals.push({Arg, 1});
 
   unique_ptr<OrderedInstructions> OI =
     make_unique<OrderedInstructions>(&getDomTree(Func));
 
   while (!Vals.empty()) {
     PtrInfo Val = Vals.front();
+    // TODO check Vals is in this function
     Value *V = Val.V;
-    // TODO Change name to
-    unsigned NestPtr = Val.PtrDepth;
+    unsigned Depth = Val.DevicePtrDepth;
     Vals.pop();
     if (!V) {
       errs() << "Empty Value*: ";
       continue;
     }
-    dp()  << "Trace depth: " << NestPtr << " value: ";
-    V->print(dp());
+    if (Instruction *I = dyn_cast<Instruction>(V)) {
+      if (I->getFunction() != Func) {
+        errs() << "Warning!!! Tracing value is not in this function\n";
+        continue;
+      }
+    }
+    dp()  << "\nTrace depth: " << Depth << " value: ";
+    if (V->hasName()) {
+      dp() << V->getName();
+    } else {
+      V->print(dp());
+    }
     dp() << "\n";
 
     // Copy Use to avoid itr broken after insert and swap
@@ -328,78 +389,102 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
       }
       // Check if User done before
       if (UserList.find(U) == UserList.end()) {
+        dp() << "\tUser: ";
         U->print(dp());
         dp() << "\n";
       } else {
         continue;
       }
       if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
+        // Store has two oprand
         if (SI->getPointerOperand() == dyn_cast<Value>(V)) {
-          //assert(0 && "StoreInst to CPU address");
-          //continue;
-          if (NestPtr < ArgDepth) {
+          if (Depth == 0) {
             insertATFuncBefore(SI, V, UserList);
-            dp() << "!!!!!! Inserted AT function before Store\n";
-            // TODO replace further load
+            // TODO replace further load/ store?
           }
         } else {
-          // ptr is store into here
-          Vals.push({SI->getPointerOperand(), NestPtr + 1, SI});
+          // tracing ptr is stored in new addr
+          // Only check use after this Store
+          Vals.push({SI->getPointerOperand(), Depth + 1, SI});
         }
-        // Only check use after this Store
-        // FIXME seems wierd
       } else if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
-        if (NestPtr < ArgDepth) {
+        if (Depth == 0) {
           insertATFuncBefore(LI, V, UserList);
-          dp() << "!!!!!! Inserted AT function before Load\n";
-        }
-        if (NestPtr > 1) {
-          Vals.push({U, NestPtr - 1});
+          if (typeContainPtr(U->getType())) {
+            dp() << "\tLoadinst valContainPtr ";
+            U->print(dp());
+            dp() << "\n";
+            Vals.push({U, 0});
+          }
+        } else if (Depth > 0 && typeContainPtr(U->getType())) {
+          dp() << "\tLoadinst valContainPtr ";
+          U->print(dp());
+          dp() << "\n";
+          Vals.push({U, Depth - 1});
         }
       } else if (CallInst *CI = dyn_cast<CallInst>(U)) {
         // check if swap callinst
         unsigned ArgIdx = _U->getOperandNo();
         Function *F = CI->getCalledFunction();
         if (!isATFunction(F)) {
-          // Cause redundant use?? FIXME
           CI = swapCallInst(CI);
           F = CI->getCalledFunction();
-          // FIXME push val???
         }
-        if (NestPtr < ArgDepth) {
-          dp() << "!!!!!! Inserted AT function before call\n";
+        if (Depth == 0) {
           insertATFuncBefore(CI, V, UserList);
         }
         traceArgInFunc(F, F->arg_begin() + ArgIdx);
+        if (typeContainPtr(CI->getType())) {
+          dp() << "\tCallInst valContainPtr ";
+          CI->print(dp());
+          dp() << "Func " << Func->getName() << " arg: " ;
+          Arg->print(dp());
+          dp() << "\n";
+          // TODO
+          // Function could return device address Depth would not be 1
+          Vals.push({CI, 1});
+        }
         continue;
-        // dont push call to Vals
       } else if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(U)) {
+        // NOTE GEPI could has multiple value for struct
         if (GEPI->getPointerOperand() == dyn_cast<Value>(V)) {
-          Vals.push({U, NestPtr});
+          if (Depth > 1) {
+            llvm::errs() << "[Warning] GEPI with value pointer val > 1\n";
+          }
+          if (typeContainPtr(U->getType())) {
+            dp() << "\tGEPI mayContainPtr ";
+            U->print(dp());
+            dp() << "\n";
+            // FIXME inherit depth??
+            Vals.push({U, Depth});
+          }
         }
       } else if (BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
         if (getPtrDepth(BCI->getSrcTy()) == getPtrDepth(BCI->getDestTy())) {
-          Vals.push({U, NestPtr});
+          Vals.push({U, Depth});
         } else {
           errs() << "Ignore different depth BitCastInst for now: ";
           BCI->dump();
         }
       } else if (AtomicRMWInst *AI = dyn_cast<AtomicRMWInst> (U)) {
         if (AI->getPointerOperand() == dyn_cast<Value>(V)) {
-          if (NestPtr < ArgDepth) {
+          if (Depth == 0) {
             insertATFuncBefore(AI, V, UserList);
-            dp() << "!!!!!! Inserted AT function before AtomicRMWInst\n";
           }
         }
         // TODO  trace??  in else
       } else if (AtomicCmpXchgInst *ACXI = dyn_cast<AtomicCmpXchgInst>(U)) {
         if (ACXI->getPointerOperand() == dyn_cast<Value>(V)) {
-          if (NestPtr < ArgDepth) {
+          if (Depth == 0) {
             insertATFuncBefore(ACXI, V, UserList);
-            dp() << "!!!!!! Inserted AT function before AtomicCmpXchgInst\n";
           }
         }
         // TODO  trace??  in else
+      } else if (ReturnInst *RI= dyn_cast<ReturnInst>(U)) {
+        // Return device addr
+        if (Depth == 0) {
+          insertATFuncBefore(RI, V, UserList);
+        }
       } else {
         errs() << "!!Unknown Inst: func/Arg/Value/User: ";
         errs() << Func->getName() << " ";
@@ -430,6 +515,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
     }
   }
   */
+  dp() << "Exit tracing function: " << Func->getName() << "\n";
 }
 
 // Inst has to be in AT function
@@ -438,7 +524,9 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
 void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
   Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
 
-  dp () << "insertATFuncBefore PtrAddr: " ;
+  dp () << "@Insert translate before Inst: ";
+  Inst->print(dp());
+  dp() << "\n\tTranslate value: " ;
   PtrAddr->print(dp());
   dp() << "\n";
   // insert bitcast
@@ -484,7 +572,7 @@ void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<
 }*/
 
 void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
-  // FIXME what does !omp_offload.info mean
+  // TODO what does !omp_offload.info mean
 
   // Prepare metadata
   vector<Metadata *> PreMetaList;
@@ -528,13 +616,15 @@ CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI) {
   CallInst *CINew = NULL;
   CINew = CallInst::Create(NewCallee->getFunctionType(), NewCallee, ArgsOfNew,
       Twine::createNull(), CI);
-  //CINew->insertBefore(CI);
+  dp() << "Replace call " << CI->getCalledFunction()->getName();
+  dp() << " to " << CINew->getCalledFunction()->getName() << "\n";
   CI->replaceAllUsesWith(CINew);
   CI->dropAllReferences();
   CI->eraseFromParent ();
   return CINew;
 }
 
+/* Unused funct
 void OmpTgtAddrTrans::eraseFunction(FunctionMapTy FunctionTrans, Function* F) {
   // Erase function
   F->dropAllReferences();
@@ -555,6 +645,7 @@ void OmpTgtAddrTrans::eraseFunction(FunctionMapTy FunctionTrans, Function* F) {
   }
   F->eraseFromParent();
 }
+*/
 
 void OmpTgtAddrTrans::getEntryFuncs(FunctionMapTy &EntryList) {
   NamedMDNode *NVVM = module->getNamedMetadata("nvvm.annotations");
@@ -593,8 +684,8 @@ THIRD:
         EntryList[Entry] = NULL;
         dp() << "Entry Function: " << Entry->getName() << "(";
         for (auto &arg : Entry->args()) {
-          arg.getType()->print(dp(),true, false);
-          dp() << " " << arg.getName() << ", ";
+          arg.print(dp());
+          dp() << ", ";
         }
         dp() << ")\n";
       }
@@ -603,7 +694,6 @@ THIRD:
 }
 
 int16_t OmpTgtAddrTrans::doSharedMemOpt() {
-  //return SUCCESS;
   // TODO
   // check if we should apply it
 
@@ -611,11 +701,8 @@ int16_t OmpTgtAddrTrans::doSharedMemOpt() {
   // @_ZZ13staticReversePiiE1s =
   //   internal addrspace(3) global [64 x i32] undef, align 4
   //   @SMforATTablein = internal addrspace(3) global [480 x i64], align 4
-  //
 
-  // FIXME could all kernel use this space??
   // Type : intptr * 3 * 20  = 480
-  //
   ArrayType *SMArrayTy = ArrayType::get(ITptr, ATTableEntyNum * MaxATTableSize);
   Constant *SMInit = UndefValue::get(SMArrayTy);
   GlobalVariable *SharedMem = new GlobalVariable(*module, SMArrayTy, false,
@@ -684,6 +771,7 @@ Argument *OmpTgtAddrTrans::getFuncTableArg(Function *F) {
 }
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
+  IsDebug = (bool) getenv("DP2");
   bool changed = false;
 
   if (init(M)) {
@@ -714,7 +802,7 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
     auto ArgItr = F->arg_begin();
     // All pointer args of entry function is CPU address
     for (size_t i = 0; i < EntryArgSize; i++, ArgItr++) {
-      if (getPtrDepth(ArgItr) > 1) {
+      if (isArgNeedAT(ArgItr)) {
         traceArgInFunc(F, ArgItr);
       }
     }

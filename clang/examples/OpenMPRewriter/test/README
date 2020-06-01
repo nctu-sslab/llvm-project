@@ -1,2 +1,4 @@
 clang -fsyntax-only -Xclang -load -Xclang /home/pschen/llvm/latest/build/lib/OpenMPRewrite.so -Xclang -plugin -Xclang omp-rewtr
 clang -fopenmp -fopenmp-targets=nvptx64
+
+clang -fsyntax-only -Xclang -load -Xclang /home/pschen/llvm/thesis/build-Debug/lib/OpenMPRewrite.so -Xclang -fopenmp -Xclang -fopenmp-targets=nvptx64  -Xclang -I/home/pschen/llvm/thesis/build-Debug/include -Xclang -I/home/pschen/sslab/src-pschen/omp_offloading/include -Xclang -plugin -Xclang omp-rewtr math.c

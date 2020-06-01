@@ -11,6 +11,7 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Sema/Sema.h"
+#include "clang/AST/OpenMPClause.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Path.h"
@@ -20,13 +21,98 @@ using namespace clang;
 namespace {
 
   // Runtime header
-std::string RuntimeFuncDecl = 
+std::string RuntimeFuncDecl =
   "#include <stdio.h>\n"
   "#include <stdint.h>\n"
   "void * __tgt_register_mem(void* mem, uint64_t size)"
   ";\n";
   //"{printf(\"mem :%p, size: %lu\\n\",mem,size);return 1; }\n";
 
+class OpenMPDCRewriter: public RecursiveASTVisitor<OpenMPDCRewriter> {
+    Rewriter &Rtr;
+    CompilerInstance &CI;
+    bool InDir = false;
+  public:
+    OpenMPDCRewriter(Rewriter &R, CompilerInstance &CI) : Rtr(R), CI(CI) {}
+    void run(TranslationUnitDecl *TUD) {
+      TraverseDecl(TUD);
+    }
+      // Goal
+      // target data
+      // target enter
+      // target exit
+      // target ... map
+      // target
+      //
+      // #pragma omp target data map(a[:n], b[:n][:n])
+      //
+      // #pragma omp target data map(a[:n], b[:n])
+      // for ( : n) {
+      // #pragma omp target data map(b[i][:n])
+      // }
+      //
+    bool VisitOMPExecutableDirective(OMPExecutableDirective *D) {
+      // TODO rewrite [:n][:n] to for
+      llvm::errs() << "VisitOMPExecutableDirective\n";
+      // filter cared Directive
+      // ssert((isa<OMPTargetEnterDataDirective>(D) ||
+      //           isa<OMPTargetExitDataDirective>(D) ||
+      //                     isa<OMPTargetUpdateDirective>(D))
+      //                     switch (D.getDirectiveKind()) {
+      /*
+    case OMPD_target_enter_data:
+      RTLFn = HasNowait ? OMPRTL__tgt_target_data_begin_nowait
+                        : OMPRTL__tgt_target_data_begin;
+      break;
+    case OMPD_target_exit_data:
+      RTLFn = HasNowait ? OMPRTL__tgt_target_data_end_nowait
+                        : OMPRTL__tgt_target_data_end;
+      break;
+    case OMPD_target_update:jkoj
+                            */
+      for (auto *C : D->clauses()) {
+        VisitOMPClause(C);
+      }
+      for (const auto *C : D->getClausesOfKind<OMPMapClause>()) {
+        for (const auto &L : C->component_lists()) {
+          const ValueDecl *VD = L.first;
+          OMPClauseMappableExprCommon::MappableExprComponentListRef M = L.second;
+
+        }
+      }
+
+      for (const auto *C : D->getClausesOfKind<OMPToClause>()) {
+        for (const auto &L : C->component_lists()) {
+        }
+      }
+      for (const auto *C : D->getClausesOfKind<OMPFromClause>()) {
+        for (const auto &L : C->component_lists()) {
+        }
+      }
+      return true;
+    }
+    /*
+    bool TraverseOMPExecutableDirective(OMPExecutableDirective *D) {
+      // TODO rewrite [:n][:n] to for
+      llvm::errs() << "TOMPExecutableDirective\n";
+      InDir = true;
+      for (auto *C : D->clauses()) {
+        TRY_TO(TraverseOMPClause(C));
+      }
+      //RecursiveASTVisitor<OpenMPDCRewriter>::TraverseOMPExecutableDirective(D);
+      InDir = false;
+      return true;
+    }*/
+    bool VisitOMPClause(OMPClause *C) {
+      llvm::errs() << "VisitOMPClause\n";
+      if (C->getClauseKind() == OpenMPClauseKind::OMPC_map) {
+        llvm::errs() << "MapClause\n";
+        //C->dump();
+      }
+      return true;
+    }
+};
+/* Old visitor
 class OpenMPRewriteASTVisitor : public RecursiveASTVisitor<OpenMPRewriteASTVisitor> {
   Rewriter &OpenMPRewriter;
   CompilerInstance &CI;
@@ -121,19 +207,22 @@ public:
     return true;
   }
 };
+*/
 
 
 class OpenMPRewriteConsumer : public ASTConsumer {
   CompilerInstance &CI;
-  OpenMPRewriteASTVisitor Visitor;
+  OpenMPDCRewriter DCRtr;
   Rewriter &OpenMPRewriter;
 
 public:
   OpenMPRewriteConsumer(CompilerInstance &Instance, Rewriter &R)
-      : CI(Instance), Visitor(R, Instance), OpenMPRewriter(R) {}
+      : CI(Instance), DCRtr(R, Instance), OpenMPRewriter(R) {}
 
   void HandleTranslationUnit(ASTContext& context) override {
-    Visitor.TraverseDecl(context.getTranslationUnitDecl());
+    DCRtr.run(context.getTranslationUnitDecl());
+    return;
+    //Visitor.TraverseDecl(context.getTranslationUnitDecl());
     FileID fid = CI.getSourceManager().getMainFileID();
     const RewriteBuffer *buf = OpenMPRewriter.getRewriteBufferFor(fid);
     if (buf) {

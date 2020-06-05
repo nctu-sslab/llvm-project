@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+file1d=$1
+file=$2
+echo $file1d vs $file
+
+
+if [ ${file: -4} == ".cpp" ]
+then
+    if [ ${file1d: -4} != ".cpp" ]
+    then
+        echo "Error two file format mismatch"
+        exit
+    fi
+    cc="clang++"
+elif [ ${file: -2} == ".c" ]
+then
+    if [ ${file1d: -2} != ".c" ]
+    then
+        echo "Error two file format mismatch"
+        exit
+    fi
+    cc="clang"
+elif [ ${file: -2} == ".h" ]
+then
+    if [ ${file1d: -2} != ".h" ]
+    then
+        echo "Error two file format mismatch"
+        exit
+    fi
+    cc="clang"
+else
+    echo "Unknown file extension"
+    exit
+fi
+
+diff $file1d $file > diff.log
+
+diff_extract.py diff.log
+
+$cc -fsyntax-only -I. -I/home/pschen/llvm/thesis/build-Debug/include -Xclang -load -Xclang /home/pschen/llvm/thesis/build-Debug/lib/HCMCounter.so -Xclang -plugin -Xclang hcm -Xclang -plugin-arg-hcm -Xclang 2 -Xclang -plugin-arg-hcm -Xclang diffline1 $file1d  > out-$file1d.json
+
+$cc -fsyntax-only -I. -I/home/pschen/llvm/thesis/build-Debug/include -Xclang -load -Xclang /home/pschen/llvm/thesis/build-Debug/lib/HCMCounter.so -Xclang -plugin -Xclang hcm -Xclang -plugin-arg-hcm -Xclang 2 -Xclang -plugin-arg-hcm -Xclang diffline2 $file  > out-$file.json
+
+
+HCMCompare.py out-$file1d.json out-$file.json
+
+rm out-$file1d.json out-$file.json diff.log diffline1 diffline2

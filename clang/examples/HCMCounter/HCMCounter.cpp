@@ -46,6 +46,11 @@ using namespace std;
 Pragma: PPkeywords
 Function call as operator
 */
+#ifdef NDEBUG
+#define HCM_DB(s)
+#else
+#define HCM_DB(s) s
+#endif
 namespace {
 
 enum Ret {
@@ -53,11 +58,14 @@ enum Ret {
   FAILED
 };
 
+const string OutFile("result.txt");
+
 // Init id table for langopts in ASTActionk
 static IdentifierTable *IdTable;
 
-#define HCM_DB(s) s
 struct HCMResult {
+  string name;
+  unsigned code_size;
   size_t n1, n2, N1, N2;
   size_t volcabulary, length;
   double estimated_length, volume, difficulty, effort, time, bugs;
@@ -86,222 +94,458 @@ struct HCMResult {
 #define LOG2(n) (log(n) / log(2))
     volcabulary = n1 + n2;
     length = N1 + N2;
-    estimated_length = n1 * LOG2(n1) + n2 * LOG2(n2);
-    volume = length * LOG2(volcabulary);
-    difficulty = n1 / 2 * N2 / n2;
+    estimated_length = LOG2(n1) * n1 + LOG2(n2) * n2;
+    volume = LOG2(volcabulary) * length;
+    difficulty = (double)n1 / 2 * N2 / n2;
     effort = difficulty * volume;
   }
   void dump() {
-    llvm::outs() << "# of distinct operators: " << n1 << "\n" <<
-      "# of operators: " << N1 << "\n" <<
-      "# of distinct operands: " << n2 << "\n" <<
-      "# of operands: " << N2 << "\n" <<
-      "Volcabulary: "  << volcabulary << "\n" <<
-      "Program Length: "  << length << "\n" <<
-      "Estimated Program Length: " << estimated_length << "\n" <<
-      "Volume: " << volume << "\n" <<
-      "Difficulty: " << difficulty << "\n" <<
-      "Effort: " << effort << "\n";
+#define OUTS_DOUBLE(d) << llvm::format("%.4lf", d)
+    llvm::outs()
+      << "\t* Distinct operators: " << n1 << "\n"
+      << "\t* Distinct operands: " << n2 << "\n"
+      << "\t* Operators: " << N1 << "\n"
+      << "\t* Operands: " << N2 << "\n"
+      << "\t* Volcabulary: "  << volcabulary << "\n"
+      << "\t* Program Length: "  << length << "\n"
+      << "\t* Estimated Program Length: "
+      OUTS_DOUBLE(estimated_length)
+      << "\n\t* Volume: "
+      OUTS_DOUBLE(volume)
+      << "\n\t* Difficulty: "
+      OUTS_DOUBLE(difficulty)
+      << "\n\t* Effort: "
+      OUTS_DOUBLE(effort)
+      << "\n";
+#undef OUTS_DOUBLE
+  }
+  string exportJson() {
+#define JSON_ENTRY(namestr, value) << "\"" namestr "\":" << value << ","
+#define JSON_ENTRY_STR(namestr, value) << "\"" namestr "\":\"" << value << "\","
+#define JSON_ENTRY_DOUBLE(namestr, value) \
+    << "\"" namestr "\":" <<  llvm::format("%.4lf",value) << ","
+#define JSON_ENTRY_DOUBLE_FINAL(namestr, value) \
+    << "\"" namestr "\":" <<  llvm::format("%.4lf",value)
+    string ret;
+    llvm::raw_string_ostream stream(ret);
+    stream
+      << "{"
+      JSON_ENTRY_STR("Name", name)
+      JSON_ENTRY("Code size", code_size)
+      JSON_ENTRY("Distinct operators", n1)
+      JSON_ENTRY("Distinct operands", n2)
+      JSON_ENTRY("Operators", N1)
+      JSON_ENTRY("Operands", N2)
+      JSON_ENTRY("Volcabulary", volcabulary)
+      JSON_ENTRY("Program Length", length)
+      JSON_ENTRY_DOUBLE("Estimated Program Length", estimated_length)
+      JSON_ENTRY_DOUBLE("Volume", volume)
+      JSON_ENTRY_DOUBLE("Difficulty", difficulty)
+      JSON_ENTRY_DOUBLE_FINAL("Effort", effort)
+      << "}";
+#undef JSON_ENTRY_DOUBLE
+#undef JSON_ENTRY
+    return ret;
+  }
+};
+class HCMCalculator {
+  CompilerInstance &CI;
+  // TODO Add list of result
+
+public:
+  HCMCalculator (CompilerInstance &CI) : CI(CI) {}
+  /* BufferEnd should be \0 */
+  HCMResult HCMonCharRange(const char *BufferBegin, const char *BufferEnd) {
+    HCMResult result;
+    SourceLocation Loc;
+    Token token;
+    Lexer RawLexer(/*Not important*/Loc,
+        CI.getLangOpts(), BufferBegin, BufferBegin, BufferEnd);
+
+    bool IsLast;
+    while(1) {
+      IsLast = RawLexer.LexFromRawLexer(token);
+      unsigned len = token.getLength();
+      // Count how many kind first
+      auto kind = token.getKind();
+      if (kind == tok::raw_identifier) {
+        // Convert raw id to keywords if possible
+        IdentifierInfo &II = IdTable->get(token.getRawIdentifier());
+        kind = II.getTokenID();
+      }
+      if (tok::isAnyIdentifier(kind)) {
+        auto TokenStrRef = token.getRawIdentifier();
+        result.Operands[TokenStrRef]++;
+        HCM_DB(llvm::errs() << "[" << TokenStrRef.str() << "]\n";)
+
+      } else if (tok::isLiteral(kind)) {
+        const char *data = token.getLiteralData();
+        string TokenStr(data,len);
+        result.Operands[TokenStr]++;
+        HCM_DB(llvm::errs() << "[" << TokenStr << "]\n";)
+      } else {
+        switch (kind) { // clang/include/clang/Basic/TokenKinds.def
+          case tok::unknown:
+          case tok::eof:
+          case tok::eod:
+          case tok::code_completion:
+            ;// ignore
+            break;
+          case tok::r_square:
+          case tok::r_paren:
+          case tok::r_brace:
+            HCM_DB(llvm::errs() << "OP: " << tok::getTokenName(kind) << "\n";)
+            ; // ignore right part of paired op
+            break;
+          default:
+            // get operators
+            HCM_DB(llvm::errs() << "OP: " << tok::getTokenName(kind) << "\n";)
+            result.Operators[kind]++;
+        }
+      }
+      if (IsLast) {
+        break;
+      }
+    }
+    result.emit();
+    result.ret = SUCCESS;
+    //result.dump();
+    return result;
+  }
+};
+using FuncCheckCallBack = std::function<bool(FunctionDecl*)>;
+
+// Rename function visitor
+class MyVisitor: public RecursiveASTVisitor<MyVisitor> {
+  CompilerInstance &CI;
+  vector<string> Functions;
+  //vector<HCMResult> Results;
+  vector<string> Results;
+  SourceManager *sm;
+  HCMCalculator Calc;
+  FileID MainFID;
+  FuncCheckCallBack *CheckFunction;
+
+public:
+  MyVisitor(CompilerInstance &CI, FileID(FID))
+    : CI(CI), Calc(CI), MainFID(FID), CheckFunction(nullptr) {
+    sm = &CI.getSourceManager();
+  }
+  vector<string> run(TranslationUnitDecl *TUD) {
+    TraverseDecl(TUD);
+    return Results;
+  }
+
+  vector<string> run(TranslationUnitDecl *TUD, FuncCheckCallBack *CB) {
+    CheckFunction = CB;
+    TraverseTranslationUnitDecl(TUD);
+    return Results;
+  }
+  bool CheckFuncLoc(FunctionDecl *FD) {
+    SourceLocation LocBegin = FD->getBeginLoc();
+    SourceLocation LocEnd = FD->getEndLoc();
+    // Begin and End should be in Main file
+    if (sm->getFileID(LocBegin) != MainFID) {
+      return false;
+    }
+    if (sm->getFileID(LocBegin) != sm->getFileID(LocEnd)) {
+      return false;
+    }
+    unsigned StartOffset = sm->getFileOffset(LocBegin);
+    unsigned EndOffset = sm->getFileOffset(LocEnd) + 1;
+    if (StartOffset >= EndOffset) {
+      llvm::errs() << "Loc range invalid\n";
+      return false;
+    }
+    return true;
+  }
+  bool HCMonFunction(FunctionDecl *FD) {
+
+    SourceLocation LocBegin = FD->getBeginLoc();
+    SourceLocation LocEnd = FD->getEndLoc();
+
+    bool invalid = false;
+    const llvm::MemoryBuffer *MemBuffer = sm->getBuffer(MainFID, &invalid);
+    if (invalid) {
+      llvm::errs() << "getBuffer failed\n";
+      return false;
+    }
+    unsigned StartOffset = sm->getFileOffset(LocBegin);
+    unsigned EndOffset = sm->getFileOffset(LocEnd) + 1;
+
+    const char *StartPtr = MemBuffer->getBufferStart() + StartOffset;
+    unsigned FuncSize = EndOffset - StartOffset;
+    // Copy the data
+    char *FunctionBody = (char *) malloc(sizeof(char) * (FuncSize + 1));
+    memcpy(FunctionBody, StartPtr, FuncSize);
+    FunctionBody[FuncSize] = 0;
+
+    HCMResult result = Calc.HCMonCharRange(FunctionBody, FunctionBody + FuncSize);
+    result.name = FD->getNameInfo().getAsString();
+    result.code_size = FuncSize;
+    Results.push_back(result.exportJson());
+    return true;
+  }
+  // Go function with body
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    if (!FD->hasBody()) {
+      return true;
+    }
+    if (!CheckFuncLoc(FD)) {
+      return true;
+    }
+    if (CheckFunction && !(*CheckFunction)(FD)) {
+       return true;
+    }
+    HCMonFunction(FD);
+    return true;
   }
 };
 
-class HCMCounter: public RecursiveASTVisitor<HCMCounter> {
-    CompilerInstance &CI;
-    vector<string> Functions;
-    SourceManager *sm;
+enum ExtractMode {
+  FileNameMode,
 
-    HCMResult HCMCount(const char *BufferBegin, const char *BufferEnd) {
-      HCMResult result;
-      // TODO ID table
-      SourceLocation Loc;
-      Token token;
-      Lexer RawLexer(/*Not important*/Loc,
-          CI.getLangOpts(), BufferBegin, BufferBegin, BufferEnd);
 
-      bool IsLast;
-      while(1) {
-        IsLast = RawLexer.LexFromRawLexer(token);
-        unsigned len = token.getLength();
-        // Count how many kind first
-        auto kind = token.getKind();
-        if (kind == tok::raw_identifier) {
-          // Convert raw id to keywords if possible
-          IdentifierInfo &II = IdTable->get(token.getRawIdentifier());
-          kind = II.getTokenID();
-        }
-        if (tok::isAnyIdentifier(kind)) {
-          auto TokenStrRef = token.getRawIdentifier();
-          result.Operands[TokenStrRef]++;
-          HCM_DB(llvm::errs() << "[" << TokenStrRef.str() << "]\n";)
+};
+// Mode 1
+class AllFuncConsumer : public ASTConsumer {
+  MyVisitor visitor;
+public:
+  AllFuncConsumer(CompilerInstance &CI)
+    : visitor(CI, CI.getSourceManager().getMainFileID()) {}
+  // Note This method is called when the ASTs for entire
+  //      translation unit have been parsed
+  void HandleTranslationUnit(ASTContext& context) override {
+    FuncCheckCallBack FuncCheckCB = [] (FunctionDecl *FD) -> bool {
+        return true;
+    };
+    visitor.run(context.getTranslationUnitDecl(), &FuncCheckCB);
+    return;
+  }
+};
 
-        } else if (tok::isLiteral(kind)) {
-          const char *data = token.getLiteralData();
-          string TokenStr(data,len);
-          result.Operands[TokenStr]++;
-          HCM_DB(llvm::errs() << "[" << TokenStr << "]\n";)
+// Mode 2
+class LocConsumer : public ASTConsumer {
+  MyVisitor visitor;
+  SourceManager *sm;
+  CompilerInstance &CI;
+  string InFile;
+public:
+  LocConsumer(CompilerInstance &CI, string InFile)
+    : visitor(CI, CI.getSourceManager().getMainFileID()), CI(CI),
+      InFile(InFile) {
+        sm = &CI.getSourceManager();
+      }
+  // Note This method is called when the ASTs for entire
+  //      translation unit have been parsed
+  void HandleTranslationUnit(ASTContext& context) override {
+    vector<unsigned > LineNums;
+
+    // Open InFile to get LineNums
+    ifstream stream(InFile.c_str());
+    if (!stream.is_open()) {
+      llvm::errs() << "Failed to open file \"" << InFile.c_str() << "\"\n";
+      return ;
+    }
+    unsigned line;
+    while (stream >> line) {
+      LineNums.push_back(line);
+    }
+    if (stream.bad()) {
+      llvm::errs() << "Failed to parse loc file \"" << InFile.c_str() << "\"\n";
+      return ;
+    }
+
+    auto sm = this->sm;
+    FuncCheckCallBack FuncCheckCB = [&LineNums, sm] (FunctionDecl *FD) -> bool {
+      bool ret = false;
+      SourceLocation LocBegin = FD->getBeginLoc();
+      SourceLocation LocEnd   = FD->getEndLoc();
+      // The two loc is ensured to be in main file
+      unsigned LineBegin = sm->getSpellingLineNumber(LocBegin);
+      unsigned LineEnd = sm->getSpellingLineNumber(LocEnd);
+      for (auto itr = LineNums.begin(); itr != LineNums.end();) {
+        if (*itr >= LineBegin && *itr <= LineEnd) {
+          ret = true;
+          // erase;
+          itr = LineNums.erase(itr);
+          continue;
         } else {
-          switch (kind) { // clang/include/clang/Basic/TokenKinds.def
-            case tok::unknown:
-            case tok::eof:
-            case tok::eod:
-            case tok::code_completion:
-              ;// ignore
-              break;
-            case tok::r_square:
-            case tok::r_paren:
-            case tok::r_brace:
-              ; // ignore right part of paired op
-              break;
-            default:
-              // get operators
-              HCM_DB(llvm::errs() << "OP: " << tok::getTokenName(kind) << "\n";)
-              result.Operators[kind]++;
-          }
-        }
-        if (IsLast) {
-          break;
+          itr++;
         }
       }
-      result.emit();
-      result.ret = SUCCESS;
-      result.dump();
-      return result;
-    }
-  public:
-    HCMCounter(CompilerInstance &CI) : CI(CI) {
-      sm = &CI.getSourceManager();
-    }
-    void run(TranslationUnitDecl *TUD) {
-      char Names[200];
-      //const char str[] = "pgain dist";
-      const char str[] = "main sort";
-      memcpy(Names, str, sizeof(str));
-      char *token = strtok(Names, " ");
-      while (token != NULL)
-      {
-          Functions.emplace_back(token);
-          token = strtok(NULL, " ");
+      return ret;
+    };
+
+    vector<string> results;
+    // run function
+    results = visitor.run(context.getTranslationUnitDecl(), &FuncCheckCB);
+
+    // Some line are not in functions
+    // FIXME  if there is lineno left -> count together
+    if (LineNums.size() != 0) {
+      llvm::errs() << "Line left: " << LineNums.size() << "\n";
+      for (auto line : LineNums) {
+        llvm::errs() << line << " ";
       }
       llvm::errs() << "\n";
+      HCMCalculator Calc(CI);
+      unsigned AllLineSize;
+      string AllLineChar;
 
-      TraverseDecl(TUD);
+      FileID MainFID = sm->getMainFileID();
+      bool invalid = false;
+      const llvm::MemoryBuffer *MemBuffer = sm->getBuffer(MainFID, &invalid);
+      if (invalid) {
+        llvm::errs() << "getBuffer failed\n";
+        return;
+      }
+      for (auto line : LineNums) {
+        // TODO wrap to a function
+        SourceLocation LocBegin = sm->translateLineCol (MainFID, line, 1);
+        SourceLocation LocEnd = sm->translateLineCol (MainFID, line+1, 1);
+
+        unsigned StartOffset = sm->getFileOffset(LocBegin);
+        unsigned EndOffset = sm->getFileOffset(LocEnd);
+        const char *StartPtr = MemBuffer->getBufferStart() + StartOffset;
+        unsigned LineSize = EndOffset - StartOffset;
+        // Copy the data TODO use smart pointer
+        char *LineBody = (char *) malloc(sizeof(char) * (LineSize + 1));
+        memcpy(LineBody, StartPtr, LineSize + 1);
+        LineBody[LineSize] = 0;
+        AllLineChar += LineBody;
+        free(LineBody);
+      }
+      /*
+      HCMResult RestResult = Calc.HCMonCharRange(AllLineChar.data(),
+          AllLineChar.data() + AllLineSize + 1);
+      RestResult.code_size = AllLineSize;
+      RestResult.name = "NonFunctionLine";
+      results.push_back(RestResult.exportJson());
+      */
     }
-    // Go function with body
-    bool VisitFunctionDecl(FunctionDecl *FD) {
-      if (!FD->hasBody()) {
-        return true;
+    string FinalResult;
+    int i = 0;
+    FinalResult += "{";
+    for (auto it = results.begin(); it != results.end(); it++) {
+      string prefix;
+      if (it != results.begin()) {
+        prefix += ",";
       }
-      if (!FD->getNameInfo().getName().isIdentifier()) {
-        return true;
-      }
-      bool found = false;
-      for (auto itr = Functions.begin(); itr != Functions.end(); itr++) {
-        if (FD->getName ().compare(*itr) == 0) {
-          llvm::errs() << "Get " << *itr << "\n";
+      prefix += "\"" + to_string(i++) + "\":";
+      FinalResult += prefix + *it;
+    }
+    FinalResult += "}";
+    llvm::outs() << FinalResult;
+    // store result to outfile
+    return;
+  }
+};
+
+// Mode 3
+class FuncListConsumer : public ASTConsumer {
+  MyVisitor visitor;
+  string InFile;
+public:
+  FuncListConsumer(CompilerInstance &CI, string InFile)
+    : visitor(CI, CI.getSourceManager().getMainFileID()), InFile(InFile) {}
+  // Note This method is called when the ASTs for entire
+  //      translation unit have been parsed
+  vector<string> ParseFuncList(string FuncList) {
+    vector<string> Functions;
+    // Use find and substr
+    return Functions;
+  }
+  void HandleTranslationUnit(ASTContext& context) override {
+    string FuncsStr;
+    vector<string> Functions = ParseFuncList(FuncsStr);
+    FuncCheckCallBack FuncCheckCB = [&Functions] (FunctionDecl *FD) -> bool {
+      bool found = false; for (auto itr = Functions.begin(); itr != Functions.end(); itr++) {
+        // FIXME  getName is not allow for special funcs
+        if (FD->getNameInfo().getAsString().compare(*itr) == 0) {
           found = true;
           Functions.erase(itr);
           break;
         }
       }
-      // FIXME
-      found = true;
       if (!found) {
-        return true;
+        return false;
       }
-
-      if (sm->getFileID(FD->getBeginLoc()) != sm->getFileID(FD->getEndLoc())) {
-        return true;
-      }
-      bool invalid = false;
-      FileID FID = sm->getFileID(FD->getBeginLoc());
-      const llvm::MemoryBuffer *MemBuffer = sm->getBuffer(FID, &invalid);
-      if (invalid) {
-        llvm::errs() << "getBuffer failed\n";
-        return true;
-      }
-      unsigned StartOffset = sm->getFileOffset(FD->getBeginLoc());
-      unsigned EndOffset = sm->getFileOffset(FD->getEndLoc()) + 1;
-      if (StartOffset >= EndOffset) {
-        llvm::errs() << "Loc range invalid\n";
-        return true;
-      }
-      const char *StartPtr = MemBuffer->getBufferStart() + StartOffset;
-      unsigned FuncSize = EndOffset - StartOffset;
-      llvm::errs() << "Function Size: " << FuncSize << "\n";
-      char *FunctionBody = (char *) malloc(sizeof(char) * (FuncSize + 1));
-      memcpy(FunctionBody, StartPtr, FuncSize);
-      FunctionBody[FuncSize] = 0;
-      HCMCount(FunctionBody, FunctionBody + FuncSize);
       return true;
-    }
+    };
+    visitor.run(context.getTranslationUnitDecl(), &FuncCheckCB);
+    return;
+  }
 };
 
-class OpenMPRewriteConsumer : public ASTConsumer {
-  CompilerInstance &CI;
-  HCMCounter Counter;
-
-public:
-  OpenMPRewriteConsumer(CompilerInstance &Instance)
-      : CI(Instance), Counter(CI) {}
-
-  void HandleTranslationUnit(ASTContext& context) override {
-    llvm::errs() << "HandleTranslationUnit\n";
-    Counter.run(context.getTranslationUnitDecl());
-    return;
-    //Visitor.TraverseDecl(context.getTranslationUnitDecl());
-    //const RewriteBuffer *buf = OpenMPRewriter.getRewriteBufferFor(fid);
-    /*
-    if (buf) {
-			SourceManager &sm = CI.getSourceManager();
-			SourceLocation loc = sm.getLocForStartOfFile(fid);
-		//	OpenMPRewriter.InsertText(loc, RuntimeFuncDecl, true, true);
-
-			std::fstream OutFile;
-      std::string name = sm.getFilename(loc).str()+".c";
+class NothingConsumer : public ASTConsumer {};
+    /* output to file
+      std::fstream OutFile;
+      std::string name = sm.getFilename(nloc).str()+".c";
 			OutFile.open(name, std::ios::out|std::ios::trunc);
 			OutFile.write(std::string(buf->begin(), buf->end()).c_str(), buf->size());
 			OutFile.close();
-    }
     */
-  }
-};
-
-class OpenMPRewriteAction : public PluginASTAction {
-  std::string DiffFile;
-  bool IsFirstDiff;
+class MyASTAction : public PluginASTAction {
+  std::string InFile;
   CompilerInstance *CI;
+  int mode;
 public:
-  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
-                                                 llvm::StringRef) override {
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(
+      CompilerInstance &CI, llvm::StringRef) override {
     IdTable = new IdentifierTable(CI.getLangOpts());
-    llvm::errs() << "CreateASTConsumer\n";
     this->CI = &CI;
-    //SourceManager &SourceMgr = CI.getSourceManager();
-    return llvm::make_unique<OpenMPRewriteConsumer>(CI);
-    //return llvm::make_unique<OpenMPRewriteConsumer>(CI, DiffFile, IsFirstDiff);
+    switch (mode) {
+      case 1:
+        //llvm::outs() << "AllFuncConsumer\n";
+        return llvm::make_unique<AllFuncConsumer>(CI);
+      case 2:
+        //llvm::outs() <<"LocConsumer\n";
+        return llvm::make_unique<LocConsumer>(CI, InFile);
+      case 3:
+        //llvm::outs() << "FuncListConsumer\n";
+        return llvm::make_unique<FuncListConsumer>(CI, InFile);
+      default:
+        llvm::outs() << "Invalid Option\n";
+        return llvm::make_unique<NothingConsumer>();
+    }
   }
   bool ParseArgs(const CompilerInstance &CI,
                  const std::vector<std::string> &args) override {
+
     if (!args.empty() && args[0] == "help") {
       PrintHelp(llvm::errs());
     }
-    return true;
-    if (args.size() != 2) {
-      llvm::errs() << "Arg size should be 2, diff file and option\n";
+    if (args.size() > 2) {
+      llvm::errs() << "Arg size should not > 2, option and a file name\n";
+      return false;
+    }
+    if (args.size() == 0) {
+      mode = 0;
       return true;
     }
-    DiffFile = args[0];
-    llvm::errs() << "diff file: " << DiffFile << "\n";
-    int DiffIndex = atoi(args[1].c_str());
-    IsFirstDiff = !DiffIndex;
-    llvm::errs() << "Is " << (IsFirstDiff ? "1st" : "2nd") << " diff file\n";
+    char *endptr;
+    mode = strtol(args[0].c_str(), &endptr, 10);
+    if (*endptr != '\0') {
+      llvm::errs() << "invalid option\n";
+      return false;
+    }
+    if (args.size() == 2) {
+      InFile = args[1];
+    }
+    /*
+     * Modes
+     * 1: Every functions with body in the main file
+     * 2: Loc to per function
+     * 3: Only Function names in append file
+     * 4: Entire files in append file
+     */
     return true;
   }
   void PrintHelp(llvm::raw_ostream& ros) {
-    ros << "usage: \nclang -cc1 -load <PATH-TO-LLVM-BUILD>/lib/OpenMPRewrite.so -plugin omp-rewtr <INPUT-FILE>\n";
+    ros << "usage: \nclang -cc1 -load <PATH-TO-LLVM-BUILD>/lib/HCMCounter.so -plugin hcm <INPUT-FILEs> [-plugin-arg-hcm <mode num>] [-plugin-arg-hcm <append file>] \n";
   }
 };
 }
 
-static FrontendPluginRegistry::Add<OpenMPRewriteAction>
- X("hcm", "HCM Counter");
+static FrontendPluginRegistry::Add<MyASTAction> X("hcm", "Halstead complexity calculator for C/C++ program");

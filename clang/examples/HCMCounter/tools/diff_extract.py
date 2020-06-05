@@ -2,7 +2,9 @@
 # This script take input from `diff`'s result
 # Output diffed lines number of two file
 
-InFileName = "diff"
+import sys
+
+InFileName = sys.argv[1]
 OutFileName1st = "diffline1"
 OutFileName2nd = "diffline2"
 class Range():
@@ -63,10 +65,10 @@ for line in lines:
         print("file1: {0}-{1}, file2: {2}-{3}".format(line1.start, line1.end, line2.start, line2.end))
         if line1 == -1:
             print("GG")
-        for i in range(line1.start, line1.end+10):
+        for i in range(line1.start, line1.end + 1):
             fout1d.write(str(i))
             fout1d.write('\n')
-        for i in range(line2.start, line2.end+10):
+        for i in range(line2.start, line2.end + 1):
             fout.write(str(i))
             fout.write('\n')
         continue

@@ -57,7 +57,6 @@ class OMPDC_Helper : public RecursiveASTVisitor<OMPDC_Helper> {
   static std::map<Type*, uint64_t> TIDMap;
   static SmallVector<MapRttArrayTy, 8> TIDList;
   static MapValuesArrayTy AdditionalPointers;
-  static MapValuesArrayTy AdditionalSizes;
   int64_t genRttTypes(QualType T) {
     // Lookup existing TID
     Type *RootType = const_cast<Type*>(T.getTypePtr());
@@ -126,7 +125,7 @@ class OMPDC_Helper : public RecursiveASTVisitor<OMPDC_Helper> {
     CurRttypeArray = last;
     return ID;
   }
-  llvm::GlobalVariable *emitRttArrayy(uint64_t ID, CodeGenModule &CGM) {
+  llvm::GlobalVariable *emitRttArray(uint64_t ID, CodeGenModule &CGM) {
     SmallVector<llvm::Constant *, 4> LiteralTypes;
     // TODO how to store ptr into
     // TODO forget about struct for now
@@ -165,7 +164,6 @@ class OMPDC_Helper : public RecursiveASTVisitor<OMPDC_Helper> {
 std::map<Type*, uint64_t> OMPDC_Helper::TIDMap;
 SmallVector<MapRttArrayTy, 8> OMPDC_Helper::TIDList;
 MapValuesArrayTy OMPDC_Helper::AdditionalPointers;
-MapValuesArrayTy OMPDC_Helper::AdditionalSizes;
 } // anonymous namespace
 
 namespace {
@@ -7879,22 +7877,24 @@ private:
         }
 
 #ifndef NO_OMP_DC
-        // IsFinalArraySection is true
+        // IsFinalArraySection is true, final itr of components
         if (IsDeepCopyExpression) {
-          if (auto AE = Components.begin()->getAssociatedExpression()) {
-            llvm::errs() << "DC Expr: ";
-            bool Invalid = false;
-            auto &ctx = CGF.getContext();
-            StringRef ExprSrc = Lexer::getSourceText(
-                CharSourceRange::getTokenRange(AE->getSourceRange()),
-                ctx.getSourceManager(), ctx.getLangOpts(), &Invalid);
-            if (!Invalid) {
-              llvm::errs() << ExprSrc << "\n";
-            }
+          auto AE = Components.begin()->getAssociatedExpression();
+          // Debug
+          llvm::errs() << "DC Expr: ";
+          bool Invalid = false;
+          auto &ctx = CGF.getContext();
+          StringRef ExprSrc = Lexer::getSourceText(
+              CharSourceRange::getTokenRange(AE->getSourceRange()),
+              ctx.getSourceManager(), ctx.getLangOpts(), &Invalid);
+          if (!Invalid) {
+            llvm::errs() << ExprSrc << "\n";
           }
           llvm::outs() << "\tComponents size: " << Components.size() << "\n";
-          OMPDC_Helper DCHelper;
+          // End of Print
 
+          OMPDC_Helper DCHelper;
+          llvm::Value *RttTypeArray, *RttSizeArray;
           Expr *E = I->getAssociatedExpression();
           assert(isa<OMPArraySectionExpr>(E));
           if (auto OASE = dyn_cast<OMPArraySectionExpr>(E)) {
@@ -7904,29 +7904,77 @@ private:
             llvm::outs() << "\tMapping type: " <<
               TargetType.getAsString() << "\n";
             auto ID = DCHelper.genRttTypes(TargetType);
-            llvm::GlobalVariable *GV = DCHelper.emitRttArrayy(ID, CGF.CGM);
+            // FIXME
+            RttTypeArray = DCHelper.emitRttArray(ID, CGF.CGM);
+            // Debug
             llvm::outs() << "\tRTT array: ";
             for (auto M : DCHelper.getRttArrayByID(ID)) {
               llvm::outs().write_hex(M);
               llvm::outs() << " ";
             }
             llvm::outs() << "\n";
-            DCHelper.AdditionalPointers.push_back(GV);
           } else {
             assert(0 && "IsFinalArraySection is not a OMPArraySectionExpr");
           }
 
-          // Gen for rest of then
           // TODO push 1 if there is a pointer
+          // Gen for rest of the sizes
+          MapValuesArrayTy RttSizes;
           for (; I != CE; ++I) {
             // append to sizes
             Expr *E = I->getAssociatedExpression();
             if (OMPArraySectionExpr *OASE = dyn_cast<OMPArraySectionExpr>(E)) {
               llvm::Value *Size = getExprTypeSize(OASE);
-              DCHelper.AdditionalSizes.push_back(
+              RttSizes.push_back(
                 CGF.Builder.CreateIntCast(Size, CGF.Int64Ty, /*isSigned=*/true));
             }
           }
+          auto &Ctx = CGF.getContext();
+          // Store sizes to local array
+          auto emitRttSizes = [&]() -> llvm::Value* {
+            QualType Int64Ty = Ctx.getIntTypeForBitwidth(64, 1);
+            QualType RttArrayTy = Ctx.getConstantArrayType(Int64Ty,
+                llvm::APInt(32, RttSizes.size(), false), ArrayType::Normal, 0);
+            auto SizeArray = CGF.CreateMemTemp(
+              RttArrayTy, ".offload_rtt_sizes").getPointer();
+            auto *llvmRttSizeTy = llvm::ArrayType::get(
+                CGF.Int64Ty, RttSizes.size());
+            for (unsigned I = 0; I < RttSizes.size(); I++) {
+              llvm::Value *S = CGF.Builder.CreateConstInBoundsGEP2_32(
+                  llvmRttSizeTy, SizeArray, 0, I);
+
+              Address SizeAddr(S, Ctx.getTypeAlignInChars(Int64Ty));
+              CGF.Builder.CreateStore(
+                  CGF.Builder.CreateIntCast(RttSizes[I], CGF.Int64Ty, true),
+                  SizeAddr);
+            }
+            return SizeArray;
+          };
+          RttSizeArray = emitRttSizes();
+
+          // Store type array and size array into a two-pointer array
+          // clang type
+          QualType RttInfoTy = Ctx.getConstantArrayType(Ctx.VoidPtrTy,
+              llvm::APInt(8, 2, false), ArrayType::Normal, 0);
+          llvm::Value *RttInfo = CGF.CreateMemTemp(
+            RttInfoTy, ".offload_rtt_info").getPointer();
+          // Store Types
+          auto *llvmRttInfoTy = llvm::ArrayType::get(CGF.VoidPtrTy, 2);
+          llvm::Value *TypeGEP = CGF.Builder.CreateConstInBoundsGEP2_32(
+            llvmRttInfoTy, RttInfo, 0, /*idx*/ 0);
+          TypeGEP = CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(
+            TypeGEP, RttTypeArray->getType()->getPointerTo(0));
+          Address TypeAddr(TypeGEP, Ctx.getTypeAlignInChars(Ctx.VoidPtrTy));
+          CGF.Builder.CreateStore(RttTypeArray, TypeAddr);
+          // Store Sizes
+          llvm::Value *SizeGEP = CGF.Builder.CreateConstInBoundsGEP2_32(
+            llvmRttInfoTy, RttInfo, 0, /*idx*/ 1);
+          SizeGEP = CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(
+            SizeGEP, RttSizeArray->getType()->getPointerTo(0));
+          Address SizeAddr(SizeGEP, Ctx.getTypeAlignInChars(Ctx.VoidPtrTy));
+          CGF.Builder.CreateStore(RttSizeArray, SizeAddr);
+          // Put into Additional
+          OMPDC_Helper::AdditionalPointers.push_back(RttInfo);
         }
 #endif
         // If we have a final array section, we are done with this expression.
@@ -8670,20 +8718,19 @@ emitOffloadingArrays(CodeGenFunction &CGF,
   Info.NumberOfPtrs = BasePointers.size();
 #ifndef NO_OMP_DC
   // append addtional
-  OMPDC_Helper DCHelper;
-  if (DCHelper.AdditionalPointers.size() > 0) {
+  if (OMPDC_Helper::AdditionalPointers.size() > 0) {
     // put OMP_MAP_HAS_NESTED to every flag
     for (auto &Flag : MapTypes) {
       //llvm::errs() << "Add OMP_MAP_HAS_NESTED\n";
       Flag |= MappableExprsHandler::OMP_MAP_HAS_NESTED;
     }
+    llvm::outs() << "Append " << OMPDC_Helper::AdditionalPointers.size() << " ptrs\n";
+    Pointers.append(OMPDC_Helper::AdditionalPointers.begin(),
+      OMPDC_Helper::AdditionalPointers.end());
+    OMPDC_Helper::AdditionalPointers.clear();
   }
-  Pointers.append(DCHelper.AdditionalPointers.begin(), DCHelper.AdditionalPointers.end());
-  Sizes.append(DCHelper.AdditionalSizes.begin(), DCHelper.AdditionalSizes.end());
-  DCHelper.AdditionalPointers.clear();
-  DCHelper.AdditionalSizes.clear();
+
   // Put addtional size and ptr here
-  Info.NumberOfSizes = Sizes.size();
   Info.NumberOfPtrsWithAppend = Pointers.size();
 #endif
 
@@ -8717,7 +8764,7 @@ emitOffloadingArrays(CodeGenFunction &CGF,
     QualType Int64Ty =
         Ctx.getIntTypeForBitwidth(/*DestWidth=*/64, /*Signed=*/1);
     if (hasRuntimeEvaluationCaptureSize) {
-      llvm::APInt SizesNumAP(32, Info.NumberOfSizes, /*isSigned=*/true);
+      llvm::APInt SizesNumAP(32, Info.NumberOfPtrs, /*isSigned=*/true);
       QualType SizeArrayType =
           Ctx.getConstantArrayType(Int64Ty, SizesNumAP, ArrayType::Normal,
                                    /*IndexTypeQuals=*/0);
@@ -8782,9 +8829,9 @@ emitOffloadingArrays(CodeGenFunction &CGF,
     }
 
     if (hasRuntimeEvaluationCaptureSize) {
-      for (unsigned I = 0; I < Info.NumberOfSizes; ++I) {
+      for (unsigned I = 0; I < Info.NumberOfPtrs; ++I) {
         llvm::Value *S = CGF.Builder.CreateConstInBoundsGEP2_32(
-            llvm::ArrayType::get(CGM.Int64Ty, Info.NumberOfSizes),
+            llvm::ArrayType::get(CGM.Int64Ty, Info.NumberOfPtrs),
             Info.SizesArray,
             /*Idx0=*/0,
             /*Idx1=*/I);
@@ -8815,7 +8862,7 @@ static void emitOffloadingArraysArgument(
         /*Idx1=*/0);
     SizesArrayArg = CGF.Builder.CreateConstInBoundsGEP2_32(
         // TODO Use the IR type
-        llvm::ArrayType::get(CGM.Int64Ty, Info.NumberOfSizes), Info.SizesArray,
+        llvm::ArrayType::get(CGM.Int64Ty, Info.NumberOfPtrs), Info.SizesArray,
         /*Idx0=*/0, /*Idx1=*/0);
     MapTypesArrayArg = CGF.Builder.CreateConstInBoundsGEP2_32(
         llvm::ArrayType::get(CGM.Int64Ty, Info.NumberOfPtrs),

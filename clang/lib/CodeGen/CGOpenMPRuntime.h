@@ -1489,7 +1489,6 @@ public:
     unsigned NumberOfPtrsWithAppend = 0u;
     /// The array of sizes passed to the runtime library.
     llvm::Value *SizesArray = nullptr;
-    unsigned NumberOfSizes = 0u;
     /// The array of map types passed to the runtime library.
     llvm::Value *MapTypesArray = nullptr;
     /// The total number of pointers passed to the runtime library.

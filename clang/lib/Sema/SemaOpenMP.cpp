@@ -13586,11 +13586,12 @@ static const Expr *checkMapClauseExpressionBase(
         // If this array section refers to the whole dimension we can still
         // accept other array sections before this one, except if the base is a
         // pointer. Otherwise, only unitary sections are accepted.
-#ifdef NO_OMP_DC
-        if (NotWhole || IsPointer)
+        if (NotWhole || IsPointer) {
           // deep copy mode allow nested whole size
+#ifdef NO_OMP_DC
           AllowWholeSizeArraySection = false;
 #endif
+        }
       } else if (AllowUnitySizeArraySection && NotUnity) {
         // A unity or whole array section is not allowed and that is not
         // compatible with the properties of the current array section.

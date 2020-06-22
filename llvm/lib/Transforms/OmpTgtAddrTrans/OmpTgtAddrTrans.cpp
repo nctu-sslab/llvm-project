@@ -6,19 +6,21 @@
 #include <queue>
 #include <unordered_set>
 
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/OrderedInstructions.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-#include "llvm/Analysis/CallGraph.h"
-#include "llvm/Transforms/IPO.h"
-#include "llvm/Analysis/OrderedInstructions.h"
 //#include "llvm/Analysis/MemoryDependenceAnalysis.h"
 
 using namespace llvm;
@@ -42,25 +44,29 @@ using namespace std;
 
 #define MAX_ATTable_SIZE 20
 
+#define MyAddressSpace 7
+
 // define LLVM_MODULE if emit llvm module
 // otherwise, visible by llvm
 //#define LLVM_MODULE
 
-bool IsDebug = false;
-
-raw_ostream &dp() {
-  std::error_code  EC;
-  static raw_fd_ostream null_ostream("/dev/null", EC, sys::fs::OF_None);
-  assert(!EC);
-  if (IsDebug) {
-    return errs(); // llvm::errs()
-  } else {
-    return null_ostream;
-  }
-}
-
 // TODO What if it is a pointer data which will also be traced
 namespace {
+  bool IsDebug = false;
+  bool IsNaiveAT = false;
+  bool EnableAS = false;
+  int InsertedATCount = 0;
+
+  raw_ostream &dp() {
+    std::error_code  EC;
+    static raw_fd_ostream null_ostream("/dev/null", EC, sys::fs::OF_None);
+    assert(!EC);
+    if (IsDebug) {
+      return errs(); // llvm::errs()
+    } else {
+      return null_ostream;
+    }
+  }
   // NOTE sync this data struct
   struct ATTableTy {
     uintptr_t HstPtrBegin;
@@ -121,6 +127,8 @@ namespace {
     void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
     bool runOnModule(Module &M) override;
     void getAnalysisUsage(AnalysisUsage &AU) const override;
+    void naiveAT(Function *);
+    vector<Value *> getSourceValues(User *U);
     void traceArgInFunc(Function *, Argument*);
     bool isATFunction(Function *Func);
     void insertATFuncBefore(Instruction *I, Value *Ptr, set<User*> &UserList);
@@ -130,13 +138,21 @@ namespace {
     bool isArgNeedAT(Argument *A);
     bool mayContainHostPtr(Value *V);
 
+    Type *addAddrSpace(Type *T);
     DominatorTree &getDomTree(Function *F);
     void getEntryFuncs(FunctionMapTy &EntryList);
     int16_t doSharedMemOpt();
+
+    // Helper function
+    string printFunction(Function *F);
   };
 }
 
 int8_t OmpTgtAddrTrans::init(Module &M) {
+  if (IsNaiveAT) {
+    llvm::errs() << "Naive Address Translation enabled\n";
+
+  }
 
   //errs() << "OmpTgtAddrTransPass is called\n";
   module = &M;
@@ -196,6 +212,21 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   // Get analysis
   //MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
   return SUCCESS;
+}
+
+// Print function with Arg
+string OmpTgtAddrTrans::printFunction(Function *F) {
+  string str;
+  raw_string_ostream s(str);
+  s << F->getName() << "(";
+  for (auto itr = F->arg_begin(); itr != F->arg_end(); itr++) {
+    if (itr != F->arg_begin()) {
+      s << ", ";
+    }
+    itr->print(s);
+  }
+  s << ")";
+  return str;
 }
 
 DominatorTree &OmpTgtAddrTrans::getDomTree(Function *F) {
@@ -261,7 +292,16 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
   ValueToValueMapTy VMap;
   for (auto &arg: F->args()) {
     //arg.dump();
-    ArgsType.push_back(arg.getType());
+    // FIXME
+    Type *T = arg.getType();
+    if (EnableAS) {
+      if (mayContainHostPtr(&arg)) {
+        dp() << "cloning function with new addressspace";
+        arg.dump();
+        T = addAddrSpace(T);
+      }
+    }
+    ArgsType.push_back(T);
   }
   ArgsType.push_back(ATTablePtrType);
   FunctionType *FT = FunctionType::get(F->getReturnType(), ArgsType, false);
@@ -287,15 +327,134 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
 
   // Clone body
   CloneFunctionInto(NewFunc, F, VMap, /*ModuleLevelChanges=*/true, Returns);
-  //errs() << "cloneFunc " << F->getName() << " to " << NewFunc->getName() << "\n";
-
+  if (EnableAS) {
+    for (size_t i = 0; i < F->arg_size();i ++) {
+      Argument *arg = &NewFunc->arg_begin()[i];
+      if (mayContainHostPtr(arg)) {
+        Type *T = FT->getParamType(i);
+        arg->mutateType(T);
+      }
+    }
+  }
+  dp() << "Clone Function \"" << printFunction(F) << "\"\n\tto \""
+    << printFunction(NewFunc) << "\"\n";
   return NewFunc;
+}
+
+void OmpTgtAddrTrans::naiveAT(Function *F) {
+  // FIXME only once per function function
+  static set<Function*> FunctionTransed;
+  if (FunctionTransed.find(F) != FunctionTransed.end()) {
+    return ;
+  }
+  FunctionTransed.insert(F);
+  bool doInsert = true;
+  StringRef name = F->getName();
+  dp() << "Naive Translate Function " << name << "\n";
+
+  // Pre kernel functions
+  if (name.startswith("__omp_offloading_")) {
+    // kernel entry function
+    doInsert = false;
+  } else if (name.startswith("__omp_outlined__")) {
+    doInsert = false;
+    StringRef index_str = name.substr(sizeof("__omp_outlined__")-1);
+    if (index_str.size() == 0) {
+      // __omp_outlined__
+    } else {
+      int index = strtol(index_str.str().c_str(), nullptr, 10);
+      if (index & 1) {
+        doInsert = true;
+      }
+    }
+  }
+  if (!doInsert) {
+    dp() << "\tEntry function don't insert\n";
+  }
+  // climb every inst
+  int MemoryInstCount = 0;
+  set<User*> dummyList;
+  for (auto &BB : *F) {
+    // copy Instruction list
+    list<Instruction*> CopiedInsts;
+    for (auto &I : BB) {
+      CopiedInsts.push_back(&I);
+    }
+    for (auto &I: CopiedInsts) {
+      Instruction *Inst = I;
+      if (CallInst *CI = dyn_cast<CallInst>(Inst)) {
+        Function *Callee = CI->getCalledFunction();
+        StringRef name = Callee->getName();
+        if (name.startswith("__omp_outlined__")) {
+          // swap call
+        } else if (name.startswith("__")) {
+          // ignore internel function
+          continue;
+        } else if (Callee->isIntrinsic()) {
+          continue;
+        }
+        /*(
+        } else if (CallInst-> what if no body??
+        */
+        CallInst *NewCallee = swapCallInst(CI);
+        naiveAT(NewCallee->getCalledFunction());
+      } else if (!doInsert) {
+        continue;
+      }
+      if (StoreInst *SI = dyn_cast<StoreInst>(Inst)) {
+        insertATFuncBefore(SI, SI->getPointerOperand(), dummyList);
+      } else if (LoadInst *LI = dyn_cast<LoadInst>(Inst)) {
+        insertATFuncBefore(LI, LI->getPointerOperand(), dummyList);
+      } else if (MemCpyInst *MCI = dyn_cast<MemCpyInst>(Inst)) {
+        insertATFuncBefore(MCI, MCI->getArgOperand(0), dummyList);
+        insertATFuncBefore(MCI, MCI->getArgOperand(1), dummyList);
+      } else if (AtomicRMWInst *AI = dyn_cast<AtomicRMWInst>(Inst)) {
+        insertATFuncBefore(AI, AI->getPointerOperand(), dummyList);
+      } else if (AtomicCmpXchgInst *ACXI = dyn_cast<AtomicCmpXchgInst>(Inst)) {
+        insertATFuncBefore(ACXI, ACXI->getPointerOperand(), dummyList);
+      } else {
+        continue;
+      }
+      MemoryInstCount++;
+    }
+  }
+  dp() << "END Func " << name << " Inserted " << MemoryInstCount << " AT\n";
+}
+
+string getValStr(Value *V, bool dump = false) {
+  string ret;
+  raw_string_ostream out(ret);
+
+  if (dump) {
+    V->print(out);
+    return ret;
+  }
+
+  if (V->hasName()) {
+    out << V->getName();
+  } else {
+    V->print(out);
+  }
+  return ret;
+}
+
+vector<Value *> OmpTgtAddrTrans::getSourceValues(User *U) {
+  vector<Value *> ret;
+  dp() << "\tgetSourceValues\n";
+
+  if (BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
+    dp() << "\t\tBitCastInst: ";
+    ret.push_back(BCI->getOperand(0));
+  }
+  return ret;
 }
 
 std::unordered_set<Argument*> TracedArgs;
 // Arg is CPU addr, keep trace it and insert AT function
 void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
-  // TODO Possible that pointer to pointer is also GPU addr
+  // TODO Insert and Delete all together at the end
+  // TODO what if passed GPU variable address
+  //    -> AT function won't work if of out range
   if (TracedArgs.find(Arg) != TracedArgs.end()) {
     return ;
   }
@@ -314,30 +473,29 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
     PtrInfo(Value *V, unsigned D, Instruction *I): V(V), DevicePtrDepth(D),
       UseAfter(I) {};
   };
-  //queue<pair<Value*, unsigned>> Vals;
-  queue<PtrInfo> Vals;
-  // TODO test per-function List
+  queue<PtrInfo> Vals; // Value waiting for tracing
+  // TODO keep this as per-function list??
 
-
-  set<User*> &UserList = AllUserList[Func];
+  set<User*> &UserList = AllUserList[Func]; // User that has been checked
+  // TODO Possible that have to be checked multiple time??
 
   if (!isATFunction(Func)) {
     errs() << "Tried to trace non-AT function: ";
     Func->getFunctionType()->dump();
     return;
   }
-  dp() << "\nTrace arg: ";
-  Arg->print(dp());
-  dp() << " In Function: " << Func->getName() << "\n";
+  dp() << "\n>>>>>>>>>>\nTrace arg: "
+    << getValStr(Arg, true) << " In Func: " << Func->getName() << "\n";
 
   Vals.push({Arg, 1});
 
+  // Regen if there is instruction changed
   unique_ptr<OrderedInstructions> OI =
     make_unique<OrderedInstructions>(&getDomTree(Func));
 
   while (!Vals.empty()) {
     PtrInfo Val = Vals.front();
-    // TODO check Vals is in this function
+    // TODO check only Vals is in this function
     Value *V = Val.V;
     unsigned Depth = Val.DevicePtrDepth;
     Vals.pop();
@@ -351,36 +509,46 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         continue;
       }
     }
-    dp()  << "\nTrace depth: " << Depth << " value: ";
-    if (V->hasName()) {
-      dp() << V->getName();
-    } else {
-      V->print(dp());
+    dp() << "\n  Trace depth: " << Depth << " value: "
+      << getValStr(V) << "\n";
+
+    if (User *self = dyn_cast<User>(V)) {
+      /*
+      dp() << ">>>>>>>>>>>>>>>>>>>>>>nserlist: \n";
+      for (auto user : UserList) {
+        dp() << getValStr(user) << " \n" ;
+      }
+      dp() << "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n";
+      */
+      if (UserList.find(self) == UserList.end()) {
+        UserList.insert(self);
+        // FIXME check self
+        dp() << "\tSelf value was not checked\n";
+        for (auto srcVal : getSourceValues(self)) {
+          dp() << "\tPush source value\n";
+          Vals.push({srcVal, Depth, Val.UseAfter});
+        }
+      }
     }
-    dp() << "\n";
 
     // Copy Use to avoid itr broken after insert and swap
     list<Use*> CopiedUses;
-    for (auto &Use : V->uses()) {
-      CopiedUses.push_back(&Use);
+    for (auto &U : V->uses()) {
+      // uses are reverse order
+      CopiedUses.insert(CopiedUses.begin(), &U);
     }
 
     for (auto _U : CopiedUses) {
       User *U = _U->getUser();
+      bool changed = false;
       if (!U) {
         errs() << "Empty User of Val: ";
         V->dump();
         continue;
       }
       // if UseAfter exist
-      if (Instruction *I = dyn_cast<Instruction>(U)) {
-        if (Val.UseAfter && OI->dfsBefore(I, Val.UseAfter)) {
-          // This is a use before it is important
-          // TODO  some use should be recheck if UseAfter is different
-          continue;
-        }
-      } else {
-        errs() << "!!Unknown user: func/Arg/Value/User/UseAfter: ";
+      if (!isa<Instruction>(U)) {
+        errs() << "!!Unknown user: func/Arg/Value/User: ";
         errs() << Func->getName() << " ";
         Arg->dump();
         V->dump();
@@ -388,39 +556,74 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         continue;
       }
       // Check if User done before
-      if (UserList.find(U) == UserList.end()) {
-        dp() << "\tUser: ";
-        U->print(dp());
-        dp() << "\n";
-      } else {
+      if (UserList.find(U) != UserList.end()) {
         continue;
+      }
+      dp() << "\tUser: " << getValStr(U, true) << "\n";
+      if (Instruction *I = dyn_cast<Instruction>(U)) {
+        if (Val.UseAfter && OI->dfsBefore(I, Val.UseAfter)) {
+          I->print(dp());
+          dp() << "\tThis user is before cared data stored, Ignore\n";
+          // This is a use before it is important
+          // TODO  some use should be recheck if UseAfter is different
+          continue;
+        }
       }
       if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
         // Store has two oprand
         if (SI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
             insertATFuncBefore(SI, V, UserList);
+            changed = true;
             // TODO replace further load/ store?
           }
         } else {
           // tracing ptr is stored in new addr
           // Only check use after this Store
+          // FIXME what if trace another user or used of this value
           Vals.push({SI->getPointerOperand(), Depth + 1, SI});
         }
       } else if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
         if (Depth == 0) {
           insertATFuncBefore(LI, V, UserList);
+          changed = true;
           if (typeContainPtr(U->getType())) {
             dp() << "\tLoadinst valContainPtr ";
-            U->print(dp());
             dp() << "\n";
             Vals.push({U, 0});
           }
         } else if (Depth > 0 && typeContainPtr(U->getType())) {
           dp() << "\tLoadinst valContainPtr ";
-          U->print(dp());
           dp() << "\n";
           Vals.push({U, Depth - 1});
+        }
+      } else if (MemCpyInst *MI = dyn_cast<MemCpyInst>(U)) {
+        // declare void @llvm.memcpy.p0i8.p0i8.i32 llvm.memcpy.p0i8.p0i8.i64
+        //        (i8* <dest>, i8* <src>, i32 <len>, i1 <isvolatile>)
+        unsigned ArgIdx = _U->getOperandNo();
+        if (ArgIdx == 1) { // this is a load
+          Value *dst = MI->getArgOperand(0);
+          if (Depth == 0) {
+            insertATFuncBefore(MI, V, UserList);
+            changed = true;
+            Vals.push({dst, 1, MI});
+            // get dst come from
+          } else if (Depth > 0) {
+            // FIXME trace another user or used of this value
+            Vals.push({dst, Depth, MI});
+          }
+          dp() << "\tMemCpyInst valContainPtr\n";
+        } else if (ArgIdx == 0) { // this is a store
+          // TODO
+          if (Depth == 0) {
+            insertATFuncBefore(MI, V, UserList);
+            changed = true;
+          }
+          // FIXME
+          // Ignore further use -> maybe not, just cause redundant translate
+        } else {
+          llvm::outs() << "Error, tracing invalid arg in MemCpyInst\n";
+          continue;
         }
       } else if (CallInst *CI = dyn_cast<CallInst>(U)) {
         // check if swap callinst
@@ -428,15 +631,16 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         Function *F = CI->getCalledFunction();
         if (!isATFunction(F)) {
           CI = swapCallInst(CI);
+          changed = true;
           F = CI->getCalledFunction();
         }
         if (Depth == 0) {
           insertATFuncBefore(CI, V, UserList);
+          changed = true;
         }
         traceArgInFunc(F, F->arg_begin() + ArgIdx);
         if (typeContainPtr(CI->getType())) {
           dp() << "\tCallInst valContainPtr ";
-          CI->print(dp());
           dp() << "Func " << Func->getName() << " arg: " ;
           Arg->print(dp());
           dp() << "\n";
@@ -444,6 +648,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
           // Function could return device address Depth would not be 1
           Vals.push({CI, 1});
         }
+        OI = make_unique<OrderedInstructions>(&getDomTree(Func));
         continue;
       } else if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(U)) {
         // NOTE GEPI could has multiple value for struct
@@ -453,7 +658,6 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
           }
           if (typeContainPtr(U->getType())) {
             dp() << "\tGEPI mayContainPtr ";
-            U->print(dp());
             dp() << "\n";
             // FIXME inherit depth??
             Vals.push({U, Depth});
@@ -463,6 +667,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         if (getPtrDepth(BCI->getSrcTy()) == getPtrDepth(BCI->getDestTy())) {
           Vals.push({U, Depth});
         } else {
+          dp() << "Ignore different depth BitCastInst for now: ";
           errs() << "Ignore different depth BitCastInst for now: ";
           BCI->dump();
         }
@@ -470,6 +675,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         if (AI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
             insertATFuncBefore(AI, V, UserList);
+            changed = true;
           }
         }
         // TODO  trace??  in else
@@ -477,6 +683,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         if (ACXI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
             insertATFuncBefore(ACXI, V, UserList);
+            changed = true;
           }
         }
         // TODO  trace??  in else
@@ -484,6 +691,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         // Return device addr
         if (Depth == 0) {
           insertATFuncBefore(RI, V, UserList);
+          changed = true;
         }
       } else {
         errs() << "!!Unknown Inst: func/Arg/Value/User: ";
@@ -494,6 +702,9 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         continue;
       }
       UserList.insert(U);
+      if (changed) {
+        OI = make_unique<OrderedInstructions>(&getDomTree(Func));
+      }
     }
   }
 
@@ -511,17 +722,18 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
           errs() << "abnormal\n";
         }
 
-      }
+      iiiiiiiiiiiiiii}
     }
   }
   */
-  dp() << "Exit tracing function: " << Func->getName() << "\n";
+  dp() << "\nExit tracing function: " << Func->getName() << "\n<<<<<<<<<<<<<\n";
 }
 
 // Inst has to be in AT function
 // TODO Load only once for same addr
 //void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Use *PtrUse, set<User*> &UserList) {
 void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
+  InsertedATCount++;
   Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
 
   dp () << "@Insert translate before Inst: ";
@@ -682,15 +894,18 @@ THIRD:
     if (auto *CAM = dyn_cast<ConstantAsMetadata>(MD->getOperand(2).get())) {
       if (CAM->getValue()->isOneValue()) {
         EntryList[Entry] = NULL;
-        dp() << "Entry Function: " << Entry->getName() << "(";
-        for (auto &arg : Entry->args()) {
-          arg.print(dp());
-          dp() << ", ";
-        }
-        dp() << ")\n";
+        dp() << "Entry Function: " << printFunction(Entry) << "\n";
       }
     }
   }
+}
+
+Type *OmpTgtAddrTrans::addAddrSpace(Type *T) {
+  if (PointerType *PT = dyn_cast<PointerType>(T)) {
+    Type *Pointee = PT->getElementType();
+    return PointerType::get(Pointee, MyAddressSpace);
+  }
+  return T;
 }
 
 int16_t OmpTgtAddrTrans::doSharedMemOpt() {
@@ -772,6 +987,8 @@ Argument *OmpTgtAddrTrans::getFuncTableArg(Function *F) {
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
   IsDebug = (bool) getenv("DP2");
+  IsNaiveAT = (bool) getenv("OMP_NAIVE_AT");
+  EnableAS = (bool) getenv("LLVM_AS");
   bool changed = false;
 
   if (init(M)) {
@@ -796,6 +1013,18 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   // Add Functions to metadata
   addEntryFunctionsAsKernel(FunctionTransEntry);
 
+  if (EnableAS) {
+    /*
+    //FunctionPass *IASP = createInferAddressSpacesPass();
+    for (auto E : FunctionTransEntry) {
+    //  TODO
+      //Function *F = E.second;
+      //dp() << printFunction(F);
+    }
+    return changed;
+    */
+  }
+
   for (auto &E : FunctionTransEntry) {
     Function *F = E.second;
     size_t EntryArgSize = F->arg_size() - 1;
@@ -803,12 +1032,20 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
     // All pointer args of entry function is CPU address
     for (size_t i = 0; i < EntryArgSize; i++, ArgItr++) {
       if (isArgNeedAT(ArgItr)) {
+        // For naive translation
+        if (IsNaiveAT) {
+          naiveAT(F);
+          break;
+        }
+        // For performance translation
         traceArgInFunc(F, ArgItr);
+
       }
     }
   }
 
   doSharedMemOpt();
+  dp() << "Inserted " << InsertedATCount << " address tranlation\n";
   dp() << "OmpTgtAddrTransPass Finished\n";
 
   return changed;
@@ -820,9 +1057,32 @@ void OmpTgtAddrTrans::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<DominatorTreeWrapperPass>();
 //  AU.addRequired<AAResultsWrapperPass>();
 //  AU.addRequired<LoopInfoWrapperPass>();
-//  AU.addRequired<DominatorTreeWrapperPass>();
 //  AU.getRequiredSet();
 }
+
+// TODO NameSpacePropagate
+namespace {
+class NameSpacePropagate {
+// julia reference
+//https://github.com/JuliaLang/julia/blob/master/src/llvm-propagate-addrspaces.cpp
+  vector<Instruction *> ToDelete;
+  vector<pair<Instruction *, Instruction *>> ToInsert;
+public:
+  bool runOnFunction(Function *F, Value *V) {
+    /*
+    for (auto it : ToInsert)
+      it.first->insertBefore(it.second);
+    for (Instruction *I : ToDelete)
+        I->eraseFromParent();
+    ToInsert.clear();
+    ToDelete.clear();
+    */
+    return true;
+  }
+};
+}
+
+
 
 char OmpTgtAddrTrans::ID = 0;
 

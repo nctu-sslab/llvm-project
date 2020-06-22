@@ -34,6 +34,9 @@ void *AddrTrans(void* addr, struct ATTableTy* table) {
             }
         }
     }
+    if (ret == 0) {
+        return addr;
+    }
     return (void*)ret;
 }
 

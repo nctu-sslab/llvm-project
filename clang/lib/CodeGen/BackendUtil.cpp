@@ -724,7 +724,7 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
     std::string Prefix("/tmp/");
     Prefix += llvm::sys::path::filename(TheModule->getSourceFileName());
     std::string PreIRFile = Prefix + "PreOmpATPass.ll";
-    std::string PostIRFile = Prefix + "PostOmpATransPass.ll";
+    std::string PostIRFile = Prefix + "PostOmpATPass.ll";
     static raw_fd_ostream RFO1(PreIRFile, ec1, sys::fs::OF_None);
     static raw_fd_ostream RFO2(PostIRFile, ec2, sys::fs::OF_None);
 

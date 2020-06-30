@@ -81,9 +81,6 @@ EXTERN void __tgt_register_requires(int64_t flags) {
 ////////////////////////////////////////////////////////////////////////////////
 /// adds a target shared library to the target execution image
 EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
-  if (getenv("Perf")) {
-    Perf.init();
-  }
   PERF_WRAP(Perf.Runtime.start();)
   RTLs.RegisterLib(desc);
   PERF_WRAP(Perf.Runtime.end();)
@@ -92,7 +89,7 @@ EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
 ////////////////////////////////////////////////////////////////////////////////
 /// unloads a target shared library
 EXTERN void __tgt_unregister_lib(__tgt_bin_desc *desc) {
-  if (getenv("Perf")) {
+  if (Perf.isEnabled()) {
     PERF_WRAP(Perf.dump();)
   }
   RTLs.UnregisterLib(desc);
@@ -107,8 +104,6 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
 
   DP("Entering data begin region for device %" PRId64 " with %d mappings\n",
       device_id, arg_num);
-  PERF_WRAP(Perf.Runtime.start();)
-  PERF_WRAP(Perf.RTDataBegin.start();)
 
   // No devices available?
   if (device_id == OFFLOAD_DEVICE_DEFAULT) {
@@ -121,6 +116,8 @@ EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
     HandleTargetOutcome(false);
     return;
   }
+  PERF_WRAP(Perf.Runtime.start();)
+  PERF_WRAP(Perf.RTDataBegin.start();)
 
   DeviceTy& Device = Devices[device_id];
 
@@ -209,8 +206,6 @@ EXTERN void __tgt_target_data_update(int64_t device_id, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
   if (IsOffloadDisabled()) return;
   DP("Entering data update with %d mappings\n", arg_num);
-  PERF_WRAP(Perf.Runtime.start();)
-  PERF_WRAP(Perf.RTDataUpdate.start();)
 
   // No devices available?
   if (device_id == OFFLOAD_DEVICE_DEFAULT) {
@@ -223,6 +218,8 @@ EXTERN void __tgt_target_data_update(int64_t device_id, int32_t arg_num,
     return;
   }
 
+  PERF_WRAP(Perf.Runtime.start();)
+  PERF_WRAP(Perf.RTDataUpdate.start();)
   DeviceTy& Device = Devices[device_id];
   int rc = target_data_update(Device, arg_num, args_base,
       args, arg_sizes, arg_types);
@@ -247,8 +244,6 @@ EXTERN int __tgt_target(int64_t device_id, void *host_ptr, int32_t arg_num,
   if (IsOffloadDisabled()) return OFFLOAD_FAIL;
   DP("Entering target region with entry point " DPxMOD " and device Id %"
       PRId64 "\n", DPxPTR(host_ptr), device_id);
-  PERF_WRAP(Perf.Runtime.start();)
-  PERF_WRAP(Perf.RTTarget.start();)
 
   if (device_id == OFFLOAD_DEVICE_DEFAULT) {
     device_id = omp_get_default_device();
@@ -260,6 +255,8 @@ EXTERN int __tgt_target(int64_t device_id, void *host_ptr, int32_t arg_num,
     return OFFLOAD_FAIL;
   }
 
+  PERF_WRAP(Perf.Runtime.start();)
+  PERF_WRAP(Perf.RTTarget.start();)
 #ifdef OMPTARGET_DEBUG
   for (int i=0; i<arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
@@ -293,8 +290,6 @@ EXTERN int __tgt_target_teams(int64_t device_id, void *host_ptr,
   if (IsOffloadDisabled()) return OFFLOAD_FAIL;
   DP("Entering target region with entry point " DPxMOD " and device Id %"
       PRId64 "\n", DPxPTR(host_ptr), device_id);
-  PERF_WRAP(Perf.Runtime.start();)
-  PERF_WRAP(Perf.RTTarget.start();)
 
   if (device_id == OFFLOAD_DEVICE_DEFAULT) {
     device_id = omp_get_default_device();
@@ -306,6 +301,8 @@ EXTERN int __tgt_target_teams(int64_t device_id, void *host_ptr,
     return OFFLOAD_FAIL;
   }
 
+  PERF_WRAP(Perf.Runtime.start();)
+  PERF_WRAP(Perf.RTTarget.start();)
 #ifdef OMPTARGET_DEBUG
   for (int i=0; i<arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64

@@ -11,7 +11,7 @@
 # define _PERF
 
 #ifdef _PERF
-#define PERF_WRAP(...) if (Perf.Enabled) do { __VA_ARGS__ } while(0);
+#define PERF_WRAP(...) if (Perf.Enabled) do { __VA_ARGS__;} while(0);
 #else
 #define PERF_WRAP(...)
 #endif
@@ -109,6 +109,7 @@ struct PerfRecordTy {
   };
   void dump();
   void init() {Enabled = true;}
+  bool isEnabled() {return Enabled;}
 };
 
 extern PerfRecordTy Perf;

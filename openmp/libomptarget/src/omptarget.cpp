@@ -223,7 +223,12 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
   void *HstPtrBegin, *HstPtrBase;
   int64_t data_size, data_type;
 
-  RttTy rtt(args + arg_num, arg_sizes + arg_num);
+  int ret;
+  RttTy Rtt;
+  if (arg_num && arg_types[0] & OMP_TGT_MAPTYPE_HAS_NESTED) {
+    Rtt.init(args + arg_num);
+  }
+
   // process each input.
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -237,19 +242,16 @@ int target_data_begin(DeviceTy &Device, int32_t arg_num,
     data_type = arg_types[i];
 
     if (data_type & OMP_TGT_MAPTYPE_NESTED) {
-      DP2("OMP_TGT_MAPTYPE_NESTED\n");
       // init Rtt with stack addr
-      int ret = rtt.init(&HstPtrBegin, &HstPtrBase, &data_size, &data_type);
+      ret = Rtt.newRttObject(&HstPtrBegin, &HstPtrBase,
+          &data_size, &data_type);
       if (ret != RTT_SUCCESS) {
         DP2("RTT init failed");
         continue;
       }
-    }
-
 DCGEN_REPEAT:
-    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
       // Regen Begin, Base, size maptype
-      int ret = rtt.computeRegion();
+      ret = Rtt.computeRegion();
       if (ret == RTT_END) {
         continue;
       }
@@ -257,10 +259,8 @@ DCGEN_REPEAT:
         return OFFLOAD_FAIL;
       }
     }
-    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
-    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
-      //goto DCGEN_REPEAT;
-    }
+
+    DP2("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
@@ -353,8 +353,8 @@ DCGEN_REPEAT:
       }
     }
 
-    PERF_WRAP(Perf.UpdatePtr.start();)
     if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      PERF_WRAP(Perf.UpdatePtr.start();)
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
           DPxPTR(Pointer_TgtPtrBegin), DPxPTR(TgtPtrBegin));
       uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
@@ -370,8 +370,8 @@ DCGEN_REPEAT:
       Device.ShadowPtrMap[Pointer_HstPtrBegin] = {HstPtrBase,
           Pointer_TgtPtrBegin, TgtPtrBase};
       Device.ShadowMtx.unlock();
+      PERF_WRAP(Perf.UpdatePtr.end();)
     }
-    PERF_WRAP(Perf.UpdatePtr.end();)
 
     if (data_type & OMP_TGT_MAPTYPE_NESTED) {
       goto DCGEN_REPEAT;
@@ -386,27 +386,56 @@ DCGEN_REPEAT:
 // With data env
 int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  DP2("target_data_begin\n");
+  void *HstPtrBegin, *HstPtrBase;
+  int64_t data_size, data_type;
+
+  int ret;
+  RttTy Rtt;
+  if (arg_num && arg_types[0] & OMP_TGT_MAPTYPE_HAS_NESTED) {
+    Rtt.init(args + arg_num, arg_sizes + arg_num);
+  }
+
   // process each input.
   for (int32_t i = 0; i < arg_num; ++i) {
     // Ignore private variables and arrays - there is no mapping for them.
     if ((arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) ||
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE)) {
-      //DP2("Value: %" PRId64 " Size: %" PRId64 " Type: 0x%lx\n", (intptr_t) HstPtrBegin, data_size, arg_types[i]);
       continue;
     }
+    HstPtrBegin = args[i];
+    HstPtrBase = args_base[i];
+    data_size = arg_sizes[i];
+    data_type = arg_types[i];
 
-    DP("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n", args[i], args_base[i], arg_sizes[i], arg_types[i]);
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      // init Rtt with stack addr
+      ret = Rtt.newRttObject(&HstPtrBegin, &HstPtrBase,
+          &data_size, &data_type);
+      if (ret != RTT_SUCCESS) {
+        DP2("RTT init failed");
+        continue;
+      }
+DCGEN_REPEAT:
+      // Regen Begin, Base, size maptype
+      ret = Rtt.computeRegion();
+      if (ret == RTT_END) {
+        continue;
+      }
+      if (ret != RTT_SUCCESS) {
+        return OFFLOAD_FAIL;
+      }
+    }
 
-    void *HstPtrBegin = args[i];
-    void *HstPtrBase = args_base[i];
-    int64_t data_size = arg_sizes[i];
+    DP2("Addr %p Base: %p size: %" PRId64 " type: 0x%lx\n",
+        HstPtrBegin, HstPtrBase, data_size, data_type);
 
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
     int64_t padding = 0;
     const int next_i = i+1;
-    if (member_of(arg_types[i]) < 0 && next_i < arg_num &&
+    if (member_of(data_type) < 0 && next_i < arg_num &&
         member_of(arg_types[next_i]) == i) {
       padding = (int64_t)HstPtrBegin % alignment;
       if (padding) {
@@ -421,15 +450,15 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
     void *Pointer_HstPtrBegin, *Pointer_TgtPtrBegin;
     //void *Pointer_HstPtrBegin; //*Pointer_TgtPtrBegin;
     bool IsNew, Pointer_IsNew;
-    bool IsImplicit = arg_types[i] & OMP_TGT_MAPTYPE_IMPLICIT;
+    bool IsImplicit = data_type & OMP_TGT_MAPTYPE_IMPLICIT;
     // UpdateRef is based on MEMBER_OF instead of TARGET_PARAM because if we
     // have reached this point via __tgt_target_data_begin and not __tgt_target
     // then no argument is marked as TARGET_PARAM ("omp target data map" is not
     // associated with a target region, so there are no target parameters). This
     // may be considered a hack, we could revise the scheme in the future.
-    bool UpdateRef = !(arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF);
-    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
-      DP("Has a pointer entry: \n");
+    bool UpdateRef = !(data_type & OMP_TGT_MAPTYPE_MEMBER_OF);
+    if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      DP2("Has a pointer entry: \n");
       // base is address of pointer.
       intptr_t ret;
       //Pointer_TgtPtrBegin = AT(HstPtrBase) translated;
@@ -466,8 +495,8 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
         " - is%s new\n", data_size, DPxPTR(HstPtrBegin),
         (IsNew ? "" : " not"));
 
-    if (arg_types[i] & OMP_TGT_MAPTYPE_RETURN_PARAM) {
-      assert( 0 && "OMP_TGT_MAPTYPE_RETURN_PARAM is unknown");
+    if (data_type & OMP_TGT_MAPTYPE_RETURN_PARAM) {
+      assert( 0 && "OMP_TGT_MAPTYPE_RETURN_PARAM is not supported yet");
       /*
       uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)HstPtrBase;
       void *TgtPtrBase = (void *)((uintptr_t)TgtPtrBegin - Delta);
@@ -476,13 +505,13 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       */
     }
 
-    if (arg_types[i] & OMP_TGT_MAPTYPE_TO) {
+    if (data_type & OMP_TGT_MAPTYPE_TO) {
       bool copy = false;
-      if (IsNew || (arg_types[i] & OMP_TGT_MAPTYPE_ALWAYS)) {
+      if (IsNew || (data_type & OMP_TGT_MAPTYPE_ALWAYS)) {
         copy = true;
-      } else if (arg_types[i] & OMP_TGT_MAPTYPE_MEMBER_OF) {
+      } else if (data_type & OMP_TGT_MAPTYPE_MEMBER_OF) {
         // Copy data only if the "parent" struct has RefCount==1.
-        int32_t parent_idx = member_of(arg_types[i]);
+        int32_t parent_idx = member_of(data_type);
         long parent_rc = Device.getMapEntryRefCnt(args[parent_idx]);
         assert(parent_rc > 0 && "parent struct not found");
         if (parent_rc == 1) {
@@ -502,23 +531,25 @@ int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
       }
     }
     if (Device.IsATEnabled) {
+      if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+        goto DCGEN_REPEAT;
+      }
       continue;
     }
 
-    if (arg_types[i] & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+    if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
+      PERF_WRAP(Perf.UpdatePtr.start())
       uint64_t Delta = (uint64_t)HstPtrBegin - (uint64_t)HstPtrBase;
       int rt = Device.suspend_update(Pointer_HstPtrBegin, HstPtrBegin, Delta, HstPtrBase);
       if (rt != OFFLOAD_SUCCESS) {
         DP2("Copying data to device failed.\n");
         return OFFLOAD_FAIL;
       }
-      // create shadow pointers for this entry
-      /* TODO
-      Device.ShadowMtx.lock();
-      Device.ShadowPtrMap[Pointer_HstPtrBegin] = {HstPtrBase,
-          Pointer_TgtPtrBegin, TgtPtrBase};
-      Device.ShadowMtx.unlock();
-      */
+      PERF_WRAP(Perf.UpdatePtr.end())
+    }
+
+    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
+      goto DCGEN_REPEAT;
     }
   }
 
@@ -530,8 +561,10 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
     void **args, int64_t *arg_sizes, int64_t *arg_types) {
   PERF_WRAP(Perf.RTDataEnd.start();)
   // process each input.
-
-  RttTy rtt(args + arg_num, arg_sizes + arg_num);
+  RttTy Rtt;
+  if (arg_num && arg_types[0] & OMP_TGT_MAPTYPE_HAS_NESTED) {
+    Rtt.initIsFrom(args, arg_types, arg_num);
+  }
 
   for (int32_t i = arg_num - 1; i >= 0; --i) {
     // Ignore private variables and arrays - there is no mapping for them.
@@ -540,28 +573,23 @@ int target_data_end(DeviceTy &Device, int32_t arg_num, void **args_base,
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE))
       continue;
 
-    //void *HstPtrBegin = args[i];
-    //int64_t data_size = arg_sizes[i];
-
+    int ret;
     void *HstPtrBegin = args[i];
     void *HstPtrBase = args_base[i];
     int64_t data_size = arg_sizes[i];
     int64_t data_type = arg_types[i];
 
     if (data_type & OMP_TGT_MAPTYPE_NESTED) {
-      DP2("OMP_TGT_MAPTYPE_NESTED\n");
       // init Rtt with stack addr
-      int ret = rtt.init(&HstPtrBegin, &HstPtrBase, &data_size, &data_type);
+      ret = Rtt.newRttObject(&HstPtrBegin, &HstPtrBase,
+          &data_size, &data_type);
       if (ret != RTT_SUCCESS) {
         DP2("RTT init failed");
         continue;
       }
-    }
-
 DCGEN_REPEAT:
-    if (data_type & OMP_TGT_MAPTYPE_NESTED) {
       // Regen Begin, Base, size maptype
-      int ret = rtt.computeRegion();
+      ret = Rtt.computeRegion();
       if (ret == RTT_END) {
         continue;
       }
@@ -569,7 +597,7 @@ DCGEN_REPEAT:
         return OFFLOAD_FAIL;
       }
     }
-    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
+    DP2("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
@@ -709,6 +737,8 @@ int target_data_update(DeviceTy &Device, int32_t arg_num,
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE))
       continue;
 
+    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", args_base[i],
+        args[i], arg_sizes[i], arg_types[i]);
     void *HstPtrBegin = args[i];
     int64_t MapSize = arg_sizes[i];
     bool IsLast;
@@ -943,6 +973,7 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     void *TgtPtrBegin;
     ptrdiff_t TgtBaseOffset;
     bool IsLast; // unused.
+    DP2("Target before launch\n");
     if (arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) {
       DP("Forwarding first-private value " DPxMOD " to the target construct\n",
           DPxPTR(HstPtrBase));
@@ -986,7 +1017,9 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBase, sizeof(void *), IsLast,
           false);
       if (Device.IsBulkEnabled) {
+        DP2("IsBulkEnabled\n");
         TgtPtrBegin = Device.bulkGetTgtPtrBegin(HstPtrBegin, sizeof(void*));
+        DP2("IsBulkEnabled end\n");
       }
       TgtBaseOffset = 0; // no offset for ptrs.
       DP("Obtained target argument " DPxMOD " from host pointer " DPxMOD " to "
@@ -996,7 +1029,9 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
       if (Device.IsBulkEnabled) {
+        DP2("IsBulkEnabled 2\n");
         TgtPtrBegin = Device.bulkGetTgtPtrBegin(HstPtrBegin, arg_sizes[i]);
+        DP2("IsBulkEnabled 2 end\n");
       }
       if (Device.IsATEnabled) {
         // FIXME skip one search

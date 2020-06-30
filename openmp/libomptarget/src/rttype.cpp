@@ -1,5 +1,6 @@
 #include <list>
 #include <map>
+#include <string.h>
 
 #include "omptarget.h"
 #include "private.h"
@@ -7,9 +8,12 @@
 
 // ID to RttJobs
 // cache result
-std::map<uint64_t, RttJobsTy*> RttJobsCache;
+static std::map<uint64_t, RttJobsTy*> RttJobsCache;
 
-int RttTy::init(void **ptr_begin, void **ptr_base,
+// For dump
+static bool first = true;
+
+int RttTy::newRttObject(void **ptr_begin, void **ptr_base,
   int64_t *data_size, int64_t *data_type) {
   isFirst = true;
 
@@ -24,85 +28,104 @@ int RttTy::init(void **ptr_begin, void **ptr_base,
 
   this->origin_type = *data_type & ~OMP_TGT_MAPTYPE_TARGET_PARAM;
 
-  // Incre rtts here
-  RttTypes *rtt = *rtts++;
-  this->rtt = rtt;
-  int32_t ID = (int32_t) (*rtt & ~RTT_TID);
-  printf("ID: %d ", ID);
-  // Dump Type
-  dumpType();
+  RttInfoTy *info = NextRttInfo();
+  RttTypes *type_array = info->RttTypeArray;
+  int64_t *size_array = info->RttSizeArray;
+
+#ifdef OMPTARGET_DEBUG
+  dumpRttInfo(info);
+#endif
 
   // check first size TODO
-  if (*data_size != *this->rtt_sizes) {
-    printf("Data size mismatch\n");
+  if (*data_size != *size_array) {
+    DP2("rtt Data size mismatch\n");
     return RTT_FAILED;
   }
-
-  auto JobsItr = RttJobsCache.find(ID);
-  if (JobsItr != RttJobsCache.end()) {
-    this->Jobs = JobsItr->second;
-  } else {
-    printf("Gen Jobs\n");
-    auto newJobs = genJobs(this->rtt + 1);
-    if (!newJobs) {
-      printf("GenJobs failed\n");
+  if (!(this->Jobs = getOrGenJobs(type_array))) {
+      DP2("rtt getOrGenJobs failed\n");
       return RTT_FAILED;
-    }
-    this->Jobs = newJobs;
-    RttJobsCache[ID] = newJobs;
   }
+
   // assign size
-  fillData(this->rtt_sizes, *ptr_begin);
-  // set CurJob
+  fillData(size_array, *ptr_begin);
+  // set CurJob to 2nd Job
   this->CurJob = ++this->Jobs->begin();
   this->BackReturning = false;
+#ifdef OMPTARGET_DEBUG
   dumpJobs();
+#endif
+  if (first) {
+    printf("[omp-dc] Deep Copy Expression\n");
+    first = false;
+  }
   return RTT_SUCCESS;
 }
 
-void RttTy::dumpType() {
-  // Do it before parsing
-  int64_t *tmp_sizes = this->rtt_sizes;
-  RttTypes *tmp_rtt = this->rtt;
-  printf("Dump rtt: ");
+void RttTy::dumpRttInfo(RttInfoTy *info) {
+  //info++;
+  RttTypes *type_array = info->RttTypeArray;
+  int64_t *size_array = info->RttSizeArray;
+  char str[160] = "";
+  char buf[80];
+
+  if (RTT_IS_TID(*type_array)) {
+    int32_t ID = (int32_t) (*type_array & ~RTT_TID);
+    sprintf(buf, "TID #%d -", ID);
+    strcat(str, buf);
+  } else {
+    fprintf(stderr, "Error invalid ID\n");
+  }
+  type_array++;
+
   do {
-    printf(" %lx", *tmp_rtt);
-    if (RTT_IS_PTR(*tmp_rtt)) {
-      printf(":%ld ", *tmp_sizes++);
+    sprintf(buf," %lx", *type_array);
+    strcat(str, buf);
+    if (RTT_IS_PTR(*type_array)) {
+      sprintf(buf, ":%ld ", *size_array);
+      strcat(str, buf);
+      size_array++;
+    } else if (!RTT_IS_BUILTIN(*type_array)) {
+      printf("Not a valid type");
+      break;
     }
-    tmp_rtt++;
-  } while (!(*tmp_rtt & RTT_BUILTIN));
-  printf("\n");
+    type_array++;
+  } while (!(*type_array & RTT_BUILTIN));
+  //  printf("HERE\n");
+  DP2("%s\n", str);
 }
 
 void RttTy::dumpJobs() {
+  if (this->isFrom) {
+    DP2("IsFrom\n");
+  }
   for (auto &it : *this->Jobs) {
+    char str[160];
     switch(it.Kind) {
       case RttJob::UpdatePtrJob:
-        printf("\tUpdatePtrJob base:%p, idx: %ld, size: %ld",
+        sprintf(str, "\tUpdatePtrJob    base:%p, idx: %ld, size: %ld",
             it.base, it.idx, it.size);
         break;
       case RttJob::DataTransferJob:
-        printf("\tDataTransferJob base:%p, size: %ld",
+        sprintf(str, "\tDataTransferJob base:%p, size: %ld",
             it.base, it.size);
         break;
       case RttJob::RootRegionJob:
-        printf("\tRootRegionJob base:%p, size: %ld",
+        sprintf(str, "\tRootRegionJob   base:%p, size: %ld",
             it.base, it.size);
         break;
       case RttJob::EndJob:
-        printf("\tEndJob");
+        sprintf(str, "\tEndJob");
         break;
       case RttJob::SkipJob:
-        printf("\tSkipJob");
+        sprintf(str, "\tSkipJob");
         break;
       default:
         break;
     }
     if (&it == &*this->CurJob) {
-      printf("   <- CurJob");
+      strcat(str, "   <- CurJob");
     }
-    printf("\n");
+    DP2("%s\n", str);
   }
 }
 // with Type
@@ -121,52 +144,59 @@ struct RttRegionInfoTy {
     size(s), type(t) {};
 };
 
-RttJobsTy *RttTy::genJobs(RttTypes *T/* without ID */) {
-  // consume first pointer
-  // First type must be a pointer
+RttJobsTy *RttTy::getOrGenJobs(RttTypes *T) {
+  // check cache
+  // 1st type is ID
+  int32_t ID = (int32_t) (*T++ & ~RTT_TID);
+  auto JobsItr = RttJobsCache.find(ID);
+  // FIXME thread unsafe
+  if (JobsItr != RttJobsCache.end()) {
+    return JobsItr->second;
+  }
+  // 2nd type must be a pointer
   if (!RTT_IS_PTR(*T++)) {
-    printf("Failed\n");
+    DP2("Failed\n");
     return nullptr;
   }
   RttJobsTy *Jobs = new RttJobsTy;
   // EndJob is on the top
   Jobs->emplace_back(RttJob::EndJob);
   int size_offset = 0;
-  if (RTT_IS_PTR(*T++)) {
-    Jobs->emplace_back(RttJob::RootRegionJob);
+  if (RTT_IS_PTR(*T)) {
+    Jobs->emplace_back(RttJob::RootRegionJob, *T);
     Jobs->emplace_back(RttJob::UpdatePtrJob);
   }
+  T++;
   while (RTT_IS_PTR(*T)) {
-    Jobs->emplace_back(RttJob::DataTransferJob);
+    Jobs->emplace_back(RttJob::DataTransferJob, *T);
     Jobs->emplace_back(RttJob::UpdatePtrJob);
     T++;
   }
   if (RTT_IS_BUILTIN(*T)) {
-    Jobs->emplace_back(RttJob::DataTransferJob);
+    Jobs->emplace_back(RttJob::DataTransferJob, *T);
   }
+  RttJobsCache[ID] = Jobs;
   return Jobs;
 }
 
-enum RttReturn RttTy::fillData(int64_t *&rtt_sizes, void *first_base) {
+enum RttReturn RttTy::fillData(int64_t *size_array, void *first_base) {
   for (auto &it : *this->Jobs) {
     switch(it.Kind) {
       case RttJob::UpdatePtrJob:
-        it.size = DIVID_PTR_SIZE(*rtt_sizes) ;
-        rtt_sizes++; // incre pointer in update ptr
+        it.size = DIVID_PTR_SIZE(*size_array) ;
+        size_array++; // incre pointer in update ptr
         break;
       case RttJob::DataTransferJob:
-        it.size = *rtt_sizes;
+        it.size = *size_array;
         break;
       case RttJob::RootRegionJob:
-        printf("Filled first job base\n");
-        it.size = *rtt_sizes;
+        it.size = *size_array;
         it.base = first_base;
         break;
       default:
         break;
     }
   }
-  rtt_sizes++;
   return RTT_SUCCESS;
 }
 
@@ -176,28 +206,21 @@ enum RttReturn RttTy::computeRegion() {
   // Deal with back
 COMPUTE:
   while (BackReturning) {
-    if (CurJob->Kind == RttJob::EndJob) {
-      return RTT_END;
-    } else if (CurJob->Kind == RttJob::UpdatePtrJob) {
+    if (CurJob->Kind == RttJob::UpdatePtrJob) {
       if (CurJob->idx >= CurJob->size) {
         CurJob--;
       } else {
         break;
       }
+    } else if (CurJob->Kind == RttJob::EndJob) {
+      return RTT_END;
     } else {
       CurJob--;
     }
   }
   switch (CurJob->Kind) {
     case RttJob::UpdatePtrJob: {
-      //printf("UpdatePtrJob\n");
       void **ptr = (void**) CurJob->base + CurJob->idx;
-      //printf("idx: %ld, size: %ld\n", CurJob->idx, CurJob->size);
-      //*ptr_base = CurJob->base;
-      //*ptr_begin = ptr;
-      //*data_size = sizeof(void*);
-      //*data_type = origin_type;
-      // Incre idx here
       CurJob->idx++;
 
       // Update base of next
@@ -207,41 +230,37 @@ COMPUTE:
       goto COMPUTE;
     }
     case RttJob::DataTransferJob: {
-      //printf("DataTransferJob\n");
       void **base = (void**)CurJob->base;
       void *ptr = *base;
       *ptr_base = base;
       *ptr_begin = ptr;
       *data_size = CurJob->size;
       *data_type = origin_type | OMP_TGT_MAPTYPE_PTR_AND_OBJ;
-      CurJob++;
-      if (CurJob->Kind == RttJob::UpdatePtrJob) {
-        CurJob->base = ptr;
-        CurJob->idx = 0;
-      }
-      break;
     }
-    case RttJob::RootRegionJob:
-      //printf("RootRegionJob\n");
+    case RttJob::RootRegionJob: {
       CurJob++;
       if (CurJob->Kind == RttJob::UpdatePtrJob) {
         CurJob->base = *ptr_begin;
         CurJob->idx = 0;
       }
+      // Skip if isFrom
+      if (this->isFrom && (CurJob->DataType & RTT_PTR)) {
+        goto COMPUTE;
+      }
       break;
+    }
     case RttJob::SkipJob:
-      //printf("SkipJob\n");
       CurJob++;
       return computeRegion();
       break;
     case RttJob::EndJob:
-      printf("This should not happend");
+      DP2("This should not happend");
       return RTT_FAILED;
   }
   if (CurJob == this->Jobs->end()) {
     CurJob--;
     BackReturning = true;
-    //printf("Going back\n");
+    //DP2("Going back\n");
   }
   return RTT_SUCCESS;
 }

@@ -1,5 +1,7 @@
 #ifndef _OMPTARGET_RTTYPE_H_
 #define _OMPTARGET_RTTYPE_H_
+
+#include "omptarget.h"
 // constraint in 1 byte
 // int64_t for unify
 //#define RTT_BYTE_MASK     0x7   // 0000 0111
@@ -30,6 +32,11 @@ enum RttTypes : uint64_t {
   RTT_TID           = 0x4UL << 60,
 };
 
+struct RttInfoTy {
+  RttTypes *RttTypeArray;
+  int64_t *RttSizeArray;
+};
+
 bool RttValidMaptype(int Type);
 
 struct RttJob {
@@ -44,23 +51,26 @@ struct RttJob {
   int64_t idx;
   int64_t size;
   int64_t size_offset;
-  enum tgt_map_type map_type_mask;
+  RttTypes DataType;
+  //enum tgt_map_type map_type_mask;
   RttJob(enum kind k) : Kind(k) {idx = 0;};
-  RttJob(enum kind k, int64_t size) : Kind(k), size(size) {
-    idx = 0;
-  };
+  RttJob(enum kind k, enum RttTypes T) : Kind(k), DataType(T) {idx = 0;};
 };
 
-typedef std::list<RttJob> RttJobsTy;
-typedef std::list<RttJob>::iterator RttJobsItrTy;
+class RttJobsTy : public std::list<RttJob> {
+};
+typedef RttJobsTy::iterator RttJobsItrTy;
 
 struct RttTy {
   // rtt args
+  /*
   RttTypes **rtts;
   int64_t *rtt_sizes;
+  */
 
-  RttTypes *rtt;
-  int64_t origin_type;
+  RttInfoTy **rtt_infos;
+
+  //RttTypes *rtt;
 
   // stack address to return
   void **ptr_begin;
@@ -68,25 +78,56 @@ struct RttTy {
   int64_t *data_size;
   int64_t *data_type;
 
+  // OMP_MAP_TYPE
+  int64_t origin_type;
+
+  // Job list
   RttJobsTy *Jobs;
   // Iterator
   RttJobsItrTy CurJob;
   bool BackReturning;
   bool isFirst;
+  bool isFrom;
 
-  RttTy(void **rtts, int64_t *rtt_sizes) :
-    rtts((RttTypes**)rtts), rtt_sizes(rtt_sizes), isFirst(true) {}
+  void init(void *RttInfo, bool isFrom = false) {
+    this->rtt_infos = (RttInfoTy **) RttInfo;
+    this->isFrom = false;
+    this->isFirst = true;
+  }
+  void initIsFrom(void **args, int64_t *arg_types, int32_t arg_num) {
+    this->isFrom = true;
+    this->isFirst = true;
+    // get Rtt count
+    int count = 0;
+    for (int i = 0; i < arg_num; i++) {
+      if (arg_types[i] & OMP_TGT_MAPTYPE_NESTED) {
+        count++;
+      }
+    }
+    //get last INFO
+    this->rtt_infos = (RttInfoTy **)(args + arg_num + count - 1);
+  }
   enum RttReturn computeRegion();
-  int init(void **ptr_begin, void **ptr_base,
+  int newRttObject(void **ptr_begin, void **ptr_base,
     int64_t *data_size, int64_t *data_type);
 
   private:
   int computeRegion1();
   static int validMaptype(int Type);
-  RttJobsTy *genJobs(RttTypes *);
-  void dumpType();
+  RttJobsTy *getOrGenJobs(RttTypes *);
+  void dumpRttInfo(RttInfoTy *);
   void dumpJobs();
-  enum RttReturn fillData(int64_t *&, void*);
+  enum RttReturn fillData(int64_t *size_array, void* first_base);
+  RttInfoTy *NextRttInfo() {
+    auto ret = *rtt_infos;
+    if (this->isFrom) {
+      // reverse TODO
+      rtt_infos--;
+    } else {
+      rtt_infos++;
+    }
+    return ret;
+  }
 };
 
 #if 0

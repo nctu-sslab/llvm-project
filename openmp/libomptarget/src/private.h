@@ -87,7 +87,7 @@ extern int DebugLevel2;
 #define DP2(...) \
   do { \
     if (DebugLevel2 > 0) { \
-      DEBUGP("omp-dc", __VA_ARGS__); \
+      DEBUGP("OMP-DC", __VA_ARGS__); \
     } \
   } while (false)
 

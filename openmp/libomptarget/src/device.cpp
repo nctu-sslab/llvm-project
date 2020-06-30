@@ -237,7 +237,6 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp);
     rc = (void *)tp;
   }
-
   DataMapMtx.unlock();
   return rc;
 }
@@ -342,6 +341,10 @@ void DeviceTy::init() {
       } else {
         fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
       }
+    }
+    if (getenv("PERF")) {
+      Perf.init();
+      EnabledOpt.append(" OmpProfiling");
     }
     fprintf(stderr, "[omp-dc]%s Enabled\n", EnabledOpt.c_str());
     IsInit = true;
@@ -707,10 +710,18 @@ void *DeviceTy::bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
   BulkLookupResult r = bulkLookupMapping(HstPtrBegin, Size);
   auto entry = r.Entry;
 
-  if (!entry->second.TgtPtrBegin) {
+  if (r.Flags.ExtendsAfter) {
+    DP2("Error, at least %p is Extends After\n", HstPtrBegin);
+  } else if (r.Flags.ExtendsBefore) {
+    DP2("Error, at least %p is Extends Before\n", HstPtrBegin);
+  } else if (!r.Flags.IsContained) {
+    DP2("%p bulkLookupMapping failed\n", HstPtrBegin);
     return NULL;
   }
-
+  if (!entry->second.TgtPtrBegin) {
+    DP2("Error, %p has not been mapping to a device address\n", HstPtrBegin);
+    return NULL;
+  }
   uintptr_t Delta = (uintptr_t)HstPtrBegin - (uintptr_t)entry->second.HstPtrBegin;
   ret = (void*)(entry->second.TgtPtrBegin + Delta);
   //DP2("Lookup " DPxMOD " get " DPxMOD "\n", DPxPTR(HstPtrBegin), DPxPTR(ret));
@@ -719,29 +730,34 @@ void *DeviceTy::bulkGetTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
 
 BulkLookupResult DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
   BulkLookupResult r;
-  void *TgtPtrBegin = NULL;
   if (IsBulkEnabled) {
-    DP("(BULK) Looking up mapping(HstPtrBegin=" DPxMOD ", Size=%ld)...\n",
+    DP2("(BULK) Looking up mapping(HstPtrBegin=" DPxMOD ", Size=%ld)...\n",
        DPxPTR(HstPtrBegin), Size);
-    // FIXME  lower latency
-    // FIXME Add extend check
+    // TODO lower latency
     auto entry = SegmentList.lower_bound((intptr_t)HstPtrBegin);
-    bool IsContained = false;
-    bool ExtendsBefore = false;
-    bool ExtendsAfter = false;
     if (entry != SegmentList.end()) {
-    //    DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
+        DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
       if ((intptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
         if ((intptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
-          IsContained = true;
+          r.Flags.IsContained = true;
           r.Entry = entry;
         } else {
-          ExtendsAfter  = true;
+          r.Flags.ExtendsAfter  = true;
+          r.Entry = entry;
         }
       } else if (entry != SegmentList.begin()) {
-        // check higher
         if ((intptr_t) HstPtrBegin + Size < (--entry)->second.HstPtrEnd) {
-          ExtendsBefore = true;
+          r.Entry = entry;
+          r.Flags.ExtendsBefore = true;
+        }
+      }
+    } else {
+      if (SegmentList.size() > 1) {
+        auto last = SegmentList.end();
+        last--;
+        if ((intptr_t) HstPtrBegin + Size < last->second.HstPtrBegin) {
+          r.Entry = last;
+          r.Flags.ExtendsBefore = true;
         }
       }
     }
@@ -765,6 +781,10 @@ bool device_is_ready(int device_num) {
 
   // Get device info
   DeviceTy &Device = Devices[device_num];
+
+  if (Device.IsInit) {
+    return true;
+  }
 
   DP("Is the device %d (local ID %d) initialized? %d\n", device_num,
        Device.RTLDeviceID, Device.IsInit);

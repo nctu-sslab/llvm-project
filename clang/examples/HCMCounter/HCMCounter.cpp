@@ -477,6 +477,25 @@ public:
     return;
   }
 };
+// Mode 4
+void PlainTextConsumer(CompilerInstance &CI, string InFile) {
+  string content, line;
+  ifstream myfile (InFile);
+  if (myfile.is_open())
+  {
+    while ( getline (myfile,line) )
+    {
+      content += line;
+    }
+    myfile.close();
+  }
+  HCMCalculator Calc(CI);
+  HCMResult result = Calc.HCMonCharRange(content.c_str(),
+      content.c_str() + content.size());
+  result.name = "plain text";
+  result.code_size = content.size();
+  llvm::outs() << result.exportJson();
+}
 
 class NothingConsumer : public ASTConsumer {};
     /* output to file
@@ -505,6 +524,10 @@ public:
       case 3:
         //llvm::outs() << "FuncListConsumer\n";
         return llvm::make_unique<FuncListConsumer>(CI, InFile);
+      case 4:
+        // No need to parse
+        PlainTextConsumer(CI, InFile);
+        return llvm::make_unique<NothingConsumer>();
       default:
         llvm::outs() << "Invalid Option\n";
         return llvm::make_unique<NothingConsumer>();

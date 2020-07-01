@@ -9,10 +9,14 @@
 #ifndef LLVM_DEMANGLE_MICROSOFT_DEMANGLE_H
 #define LLVM_DEMANGLE_MICROSOFT_DEMANGLE_H
 
+#include <stdint.h>
+#include <string>
+
 #include "llvm/Demangle/DemangleConfig.h"
 #include "llvm/Demangle/MicrosoftDemangleNodes.h"
 #include "llvm/Demangle/StringView.h"
 #include "llvm/Demangle/Utility.h"
+
 
 #include <utility>
 

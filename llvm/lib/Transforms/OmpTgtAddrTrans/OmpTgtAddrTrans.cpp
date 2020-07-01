@@ -491,7 +491,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
 
   // Regen if there is instruction changed
   unique_ptr<OrderedInstructions> OI =
-    make_unique<OrderedInstructions>(&getDomTree(Func));
+    std::make_unique<OrderedInstructions>(&getDomTree(Func));
 
   while (!Vals.empty()) {
     PtrInfo Val = Vals.front();
@@ -648,7 +648,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
           // Function could return device address Depth would not be 1
           Vals.push({CI, 1});
         }
-        OI = make_unique<OrderedInstructions>(&getDomTree(Func));
+        OI = std::make_unique<OrderedInstructions>(&getDomTree(Func));
         continue;
       } else if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(U)) {
         // NOTE GEPI could has multiple value for struct
@@ -703,7 +703,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
       }
       UserList.insert(U);
       if (changed) {
-        OI = make_unique<OrderedInstructions>(&getDomTree(Func));
+        OI = std::make_unique<OrderedInstructions>(&getDomTree(Func));
       }
     }
   }

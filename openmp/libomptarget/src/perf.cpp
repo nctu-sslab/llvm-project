@@ -9,6 +9,9 @@ PerfRecordTy Perf;
 // start timer
 void PerfEventTy::start() {
   if (Lock) {
+    if (LockAction) {
+      LockAction->start();
+    }
     return;
   }
   if (LockTarget) {
@@ -23,6 +26,9 @@ void PerfEventTy::start() {
 // end timer
 void PerfEventTy::end() {
   if (Lock) {
+    if (LockAction) {
+      LockAction->end();
+    }
     return;
   }
   assert(StartCnt > 0 && "PerfEvent end withnot started");

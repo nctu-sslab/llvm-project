@@ -34,7 +34,7 @@ struct PerfEventTy : public PerfBaseTy {
   int Count;
   int StartCnt;
   bool Lock;
-  PerfEventTy *LockTarget;
+  PerfEventTy *LockTarget, *LockAction;
 
   high_resolution_clock::time_point StartTime;
   duration<double> time_span;
@@ -44,6 +44,9 @@ struct PerfEventTy : public PerfBaseTy {
   void setLockTarget(PerfEventTy *target) {
     LockTarget = target;
   };
+  void setLockAction(PerfEventTy *action_target) {
+    LockAction = action_target;
+  }
   void start();
   void end();
   void dump();
@@ -77,6 +80,9 @@ struct PerfRecordTy {
   PerfEventTy UpdatePtr;
   PerfEventTy D2HTransfer;
 
+  PerfEventTy updateH2D;
+  PerfEventTy updateD2H;
+
   PerfEventTy RTDataBegin;
   PerfEventTy RTDataUpdate;
   PerfEventTy RTDataEnd;
@@ -92,9 +98,12 @@ struct PerfRecordTy {
 #define SET_PERF_NAME(Name) Perfs.push_back(Name.setName(#Name));
     SET_PERF_NAME(Runtime); // NOTE this contains following 4
     SET_PERF_NAME(Kernel);
-    SET_PERF_NAME(H2DTransfer); //  NOTE this contains UpdatePtr
     SET_PERF_NAME(UpdatePtr);
+    SET_PERF_NAME(H2DTransfer); //  NOTE this contains UpdatePtr
     SET_PERF_NAME(D2HTransfer);
+
+    SET_PERF_NAME(updateH2D);
+    SET_PERF_NAME(updateD2H);
 
     SET_PERF_NAME(RTTarget);
     SET_PERF_NAME(RTDataBegin);
@@ -106,6 +115,10 @@ struct PerfRecordTy {
     SET_PERF_NAME(TargetMem);
 #undef SET_PERF_NAME
     UpdatePtr.setLockTarget(&H2DTransfer);
+    H2DTransfer.setLockAction(&updateH2D);
+    D2HTransfer.setLockAction(&updateD2H);
+
+
   };
   void dump();
   void init() {Enabled = true;}

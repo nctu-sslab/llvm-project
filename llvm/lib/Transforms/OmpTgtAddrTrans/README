@@ -1,8 +1,7 @@
 # TODO
 
+* Install the obj to build dir
+
 # Commnad
 
-
-$ opt -S -load $(LLVM_BULKD)/lib/LLVMOmpTgtAddrTrans.so -OmpTgtAddrTransPass < test.ll > out.ll
-
-
+$ opt -S -load $LLVM_BUILD_PATH/lib/LLVMOmpTgtAddrTrans.so -OmpTgtAddrTrans > out.ll < 2D.cPreOmpATPass.ll                                                         (pschen✗)

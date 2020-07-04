@@ -151,7 +151,6 @@ namespace {
 int8_t OmpTgtAddrTrans::init(Module &M) {
   if (IsNaiveAT) {
     llvm::errs() << "Naive Address Translation enabled\n";
-
   }
 
   //errs() << "OmpTgtAddrTransPass is called\n";
@@ -164,13 +163,14 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
     //return FAILED;
   }
   // Use a metadata to avoid double application
-  if (M.getNamedMetadata("omptgtaddrtrans")) {
+  if (M.getNamedMetadata("omp_offload.addrtranspass")) {
+    errs() << "Metadata omptgtaddrtrans already exist!\n";
     return FAILED;
   } else if (!M.getNamedMetadata("nvvm.annotations")) {
     errs() << "Error no nvvm.annotations metadata found!\n";
     return FAILED;
   } else {
-    M.getOrInsertNamedMetadata("omptgtaddrtrans");
+    M.getOrInsertNamedMetadata("omp_offload.addrtranspass");
   }
 
   DataLayout DL(&M);
@@ -986,12 +986,14 @@ Argument *OmpTgtAddrTrans::getFuncTableArg(Function *F) {
 }
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
+  dp() << "Entering OmpTgtAddrTransPass\n";
   IsDebug = (bool) getenv("DP2");
   IsNaiveAT = (bool) getenv("OMP_NAIVE_AT");
   EnableAS = (bool) getenv("LLVM_AS");
   bool changed = false;
 
   if (init(M)) {
+    dp() << "[OmpTgtAddrTransPass] Failed to init, exit\n";
     return changed;
   }
 

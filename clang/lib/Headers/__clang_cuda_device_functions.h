@@ -462,6 +462,13 @@ __DEVICE__ int __isnanf(float __a) { return __nv_isnanf(__a); }
 #ifdef _MSC_VER
 __DEVICE__ int __isnanl(long double __a);
 #endif
+
+#ifdef __FOR_PSCHEN_THESIS
+#ifndef __cplusplus
+__DEVICE__ int isnan(double __a) { return __isnan(__a); }
+__DEVICE__ int isinf(double __a) { return __isinf(__a); }
+#endif
+#endif
 __DEVICE__ double __ll2double_rd(long long __a) {
   return __nv_ll2double_rd(__a);
 }

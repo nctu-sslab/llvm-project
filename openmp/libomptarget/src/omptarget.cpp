@@ -19,6 +19,7 @@
 
 #include <cassert>
 #include <vector>
+#include <inttypes.h>
 
 #include "perf.h"
 #include "at.h"

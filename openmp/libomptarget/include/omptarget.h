@@ -27,8 +27,8 @@
 
 
 // Origin flags
-#define OMPTARGET_DEBUG
-#define CUDA_ERROR_REPORT
+//#define OMPTARGET_DEBUG
+//#define CUDA_ERROR_REPORT
 /*---------------------------------*/
 
 #define OFFLOAD_SUCCESS (0)

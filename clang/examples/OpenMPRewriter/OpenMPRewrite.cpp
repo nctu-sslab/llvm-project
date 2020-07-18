@@ -13,6 +13,7 @@
 #include "clang/Sema/Sema.h"
 #include "clang/AST/OpenMPClause.h"
 #include "clang/Rewrite/Core/Rewriter.h"
+#include "clang/Lex/Lexer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Path.h"
 
@@ -28,14 +29,28 @@ std::string RuntimeFuncDecl =
   ";\n";
   //"{printf(\"mem :%p, size: %lu\\n\",mem,size);return 1; }\n";
 
+
+
+
 class OpenMPDCRewriter: public RecursiveASTVisitor<OpenMPDCRewriter> {
     Rewriter &Rtr;
     CompilerInstance &CI;
+    SourceManager *sm;
+    LangOptions *lopt;
     bool InDir = false;
   public:
-    OpenMPDCRewriter(Rewriter &R, CompilerInstance &CI) : Rtr(R), CI(CI) {}
+    OpenMPDCRewriter(Rewriter &R, CompilerInstance &CI) : Rtr(R), CI(CI) {
+      sm = &CI.getSourceManager();
+      lopt = &CI.getLangOpts();
+    }
     void run(TranslationUnitDecl *TUD) {
       TraverseDecl(TUD);
+    }
+    std::string stmt2String(Stmt *d) {
+      SourceLocation b(d->getBeginLoc()), _e(d->getEndLoc());
+      SourceLocation e(clang::Lexer::getLocForEndOfToken(_e, 0, *sm, *lopt));
+      return std::string(sm->getCharacterData(b),
+        sm->getCharacterData(e)-sm->getCharacterData(b));
     }
       // Goal
       // target data
@@ -71,6 +86,7 @@ class OpenMPDCRewriter: public RecursiveASTVisitor<OpenMPDCRewriter> {
     case OMPD_target_update:jkoj
                             */
       for (auto *C : D->clauses()) {
+        // Clauses
         VisitOMPClause(C);
       }
       for (const auto *C : D->getClausesOfKind<OMPMapClause>()) {
@@ -106,7 +122,22 @@ class OpenMPDCRewriter: public RecursiveASTVisitor<OpenMPDCRewriter> {
     bool VisitOMPClause(OMPClause *C) {
       llvm::errs() << "VisitOMPClause\n";
       if (C->getClauseKind() == OpenMPClauseKind::OMPC_map) {
-        llvm::errs() << "MapClause\n";
+
+        llvm::errs() << "OMPClause map kind\n";
+        if (OMPMapClause *OMC = dyn_cast<OMPMapClause>(C)) {
+          llvm::errs() << "OMPMapClause, ComListNum: " << OMC->getTotalComponentListNum() << "\n";
+          OMC->getBeginLoc().dump(*sm);
+          OMC->getEndLoc().dump(*sm);
+          int i = 0;
+          for (const auto &OMELC : OMC->component_lists ()) {
+            for (const auto &MC : OMELC.second) {
+              Expr *e = MC.getAssociatedExpression();
+              llvm::errs() << "Idx: " << i++ << stmt2String(e) << "\n";
+              //MC.getAssociatedExpression ()->dump();
+            }
+          }
+
+        }
         //C->dump();
       }
       return true;

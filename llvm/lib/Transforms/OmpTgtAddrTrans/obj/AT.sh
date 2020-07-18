@@ -13,7 +13,7 @@
 
 rm -f AT.cubin
 
-clang++  --cuda-gpu-arch=sm_60 --cuda-device-only -c AT.cu -o AT.cubin -Xcuda-ptxas -c
+clang++ -O2 --cuda-gpu-arch=sm_60 --cuda-device-only -c AT.cu -o AT.cubin -Xcuda-ptxas -c
 
 # Bypass clang remove this file
 chmod a-w AT.cubin

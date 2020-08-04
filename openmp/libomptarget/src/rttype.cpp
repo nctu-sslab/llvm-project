@@ -236,6 +236,12 @@ COMPUTE:
       *ptr_begin = ptr;
       *data_size = CurJob->size;
       *data_type = origin_type | OMP_TGT_MAPTYPE_PTR_AND_OBJ;
+      CurJob++;
+      if (CurJob->Kind == RttJob::UpdatePtrJob) {
+        CurJob->base = ptr;
+        CurJob->idx = 0;
+      }
+      break;
     }
     case RttJob::RootRegionJob: {
       CurJob++;

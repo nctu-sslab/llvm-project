@@ -69,7 +69,8 @@ enum ExecutionModeType {
 /// Use a single entity to encode a kernel and a set of flags
 struct KernelTy {
   CUfunction Func;
-  CUfunction FuncAT;
+  CUfunction *TableATFPtr;
+  CUfunction *MaskATFPtr;
 
   // execution mode of kernel
   // 0 - SPMD mode (without master warp)
@@ -77,13 +78,16 @@ struct KernelTy {
   int8_t ExecutionMode;
 
   std::string KerName;
-  bool HasAT;
 
+  /*
   KernelTy(CUfunction _Func, int8_t _ExecutionMode, char *_Name)
-      : Func(_Func), ExecutionMode(_ExecutionMode), HasAT(false), KerName(_Name) {}
+      : Func(_Func), ExecutionMode(_ExecutionMode), KerName(_Name) {}
+      */
 
-  KernelTy(CUfunction _Func, CUfunction _ATFunc, int8_t _ExecutionMode, char *_Name)
-      : Func(_Func), FuncAT(_ATFunc), ExecutionMode(_ExecutionMode), HasAT(true), KerName(_Name){}
+  KernelTy(CUfunction _Func, int8_t _ExecutionMode, char *_Name
+      ,CUfunction *_ATFuncTable = NULL, CUfunction *_ATFuncMask = NULL)
+      : Func(_Func), ExecutionMode(_ExecutionMode), KerName(_Name)
+        ,TableATFPtr(_ATFuncTable), MaskATFPtr(_ATFuncMask) {}
 };
 
 /// Device envrionment data
@@ -485,7 +489,8 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
     }
 
     CUfunction fun;
-    CUfunction funAT;
+    CUfunction *funATTable;
+    CUfunction *funATMask;
     bool HasAT = true;
     err = cuModuleGetFunction(&fun, cumod, e->name);
 
@@ -499,18 +504,39 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
     DP("Entry point " DPxMOD " maps to %s (" DPxMOD ")\n",
         DPxPTR(e - HostBegin), e->name, DPxPTR(fun));
 
-    // Load AT function
-    std::string ATFuncName(e->name);
-    ATFuncName.append("_AT");
-    err = cuModuleGetFunction(&funAT, cumod, ATFuncName.c_str());
+    // Try Load AT Table function
+    {
+      funATTable = new CUfunction;
+      std::string Name(e->name);
+      Name.append("_AT_TABLE");
+      err = cuModuleGetFunction(funATTable, cumod, Name.c_str());
+    }
 
     if (err != CUDA_SUCCESS) {
-      DP("Loading '%s' (Failed)\n", ATFuncName.c_str());
+      DP("Loading '%s' TableAT ver. (Failed)\n", e->name);
       CUDA_ERR_STRING(err);
-      HasAT = false;
+      delete funATTable;
+      funATTable = NULL;
     } else {
-      DP("Entry point " DPxMOD " maps to %s (" DPxMOD ")\n",
-          DPxPTR(e - HostBegin), ATFuncName.c_str(), DPxPTR(funAT));
+      DP("Entry point " DPxMOD " TableAT ver. maps to %s (" DPxMOD ")\n",
+          DPxPTR(e - HostBegin), e->name, DPxPTR(funATTable));
+    }
+    // Try Load AT Table function
+    {
+      funATMask = new CUfunction;
+      std::string Name(e->name);
+      Name.append("_AT_MASK");
+      err = cuModuleGetFunction(funATMask, cumod, Name.c_str());
+    }
+
+    if (err != CUDA_SUCCESS) {
+      DP("Loading '%s' MaskAT ver. (Failed)\n", e->name);
+      CUDA_ERR_STRING(err);
+      delete funATMask;
+      funATMask = NULL;
+    } else {
+      DP("Entry point " DPxMOD " MaskAT ver. maps to %s (" DPxMOD ")\n",
+          DPxPTR(e - HostBegin), e->name, DPxPTR(funATMask));
     }
 
     // default value GENERIC (in case symbol is missing from cubin file)
@@ -550,11 +576,14 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
       CUDA_ERR_STRING(err);
     }
 
+    KernelsList.push_back(
+        KernelTy(fun, ExecModeVal, e->name, funATTable, funATMask));
+    /*jhkjjj
     if (HasAT) {
-      KernelsList.push_back(KernelTy(fun, funAT, ExecModeVal, e->name));
     } else {
       KernelsList.push_back(KernelTy(fun, ExecModeVal, e->name));
     }
+    */
 
     __tgt_offload_entry entry = *e;
     entry.addr = (void *)&KernelsList.back();
@@ -738,13 +767,9 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   }
 
   int kernel_limit;
-  if (KernelInfo->HasAT) {
-    err = cuFuncGetAttribute(&kernel_limit,
-        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->FuncAT);
-  } else {
-    err = cuFuncGetAttribute(&kernel_limit,
-        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->Func);
-  }
+  // FIXME AT function will different??
+  err = cuFuncGetAttribute(&kernel_limit,
+      CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, KernelInfo->Func);
   if (err == CUDA_SUCCESS) {
     if (kernel_limit < cudaThreadsPerBlock) {
       cudaThreadsPerBlock = kernel_limit;
@@ -796,9 +821,13 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   DP("Launch kernel with %d blocks and %d threads\n", cudaBlocksPerGrid,
      cudaThreadsPerBlock);
 
-  if (DeviceInfo.OffloadMode == OMP_OFFMODE_ADDR_TRANS && KernelInfo->HasAT) {
-    DP("Using AT Kernel\n");
-    err = cuLaunchKernel(KernelInfo->FuncAT, cudaBlocksPerGrid, 1, 1,
+  if (DeviceInfo.OffloadMode == OMP_OFFMODE_AT_TABLE) {
+    DP("Using AT Table Kernel\n");
+    err = cuLaunchKernel(*KernelInfo->TableATFPtr, cudaBlocksPerGrid, 1, 1,
+        cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
+  } else if (DeviceInfo.OffloadMode == OMP_OFFMODE_AT_MASK) {
+    DP("Using AT Mask Kernel\n");
+    err = cuLaunchKernel(*KernelInfo->MaskATFPtr, cudaBlocksPerGrid, 1, 1,
         cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
   } else {
     err = cuLaunchKernel(KernelInfo->Func, cudaBlocksPerGrid, 1, 1,
@@ -806,6 +835,7 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   }
   if (err != CUDA_SUCCESS) {
     DP("Device kernel launch failed!\n");
+    printf("Device kernel launch failed!\n");
     CUDA_ERR_STRING(err);
     return OFFLOAD_FAIL;
   }
@@ -836,21 +866,37 @@ int32_t __tgt_rtl_run_target_region(int32_t device_id, void *tgt_entry_ptr,
 }
 
 int32_t __tgt_rtl_set_mode(int32_t mode) {
+  int all_kernel_AT;
   switch (mode) {
-    case OMP_OFFMODE_ADDR_TRANS:
+    case OMP_OFFMODE_AT_TABLE:
       // Check every kernel has AT
-      int all_kernel_AT = 1;
+      all_kernel_AT = 1;
       for (auto &K : KernelsList) {
-        if (!K.HasAT) {
+        if (!K.TableATFPtr) {
           all_kernel_AT = 0;
         }
       }
       if (all_kernel_AT) {
-        DP("Set rtl mode to OMP_OFFMODE_ADDR_TRANS\n");
+        DP("Set rtl mode to OMP_OFFMODE_AT_TABLE\n");
       } else {
-        DP("Failed to set rtl mode to OMP_OFFMODE_ADDR_TRANS\n");
+        DP("Failed to set rtl mode to OMP_OFFMODE_AT_TABLE\n");
         return OFFLOAD_FAIL;
       }
+      break;
+    case OMP_OFFMODE_AT_MASK:
+      all_kernel_AT = 1;
+      for (auto &K : KernelsList) {
+        if (!K.MaskATFPtr) {
+          all_kernel_AT = 0;
+        }
+      }
+      if (all_kernel_AT) {
+        DP("Set rtl mode to OMP_OFFMODE_AT_MASK\n");
+      } else {
+        DP("Failed to set rtl mode to OMP_OFFMODE_AT_MASK\n");
+        return OFFLOAD_FAIL;
+      }
+      break;
   }
   DeviceInfo.OffloadMode = mode;
   return OFFLOAD_SUCCESS;

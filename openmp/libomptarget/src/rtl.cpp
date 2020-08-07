@@ -48,6 +48,10 @@ void RTLsTy::LoadRTLs() {
   }
 #endif // OMPTARGET_DEBUG
 
+  if (char *envStr = getenv("OMP_NO_HOSTSHADOW")) {
+    OptNoHostShadow = std::stoi(envStr);
+  }
+
   // Parse environment variable OMP_TARGET_OFFLOAD (if set)
   TargetOffloadPolicy = (kmp_target_offload_kind_t) __kmpc_get_target_offload();
   if (TargetOffloadPolicy == tgt_disabled) {

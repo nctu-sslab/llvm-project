@@ -350,3 +350,25 @@ EXTERN void __kmpc_push_target_tripcount(int64_t device_id,
       loop_tripcount);
   Devices[device_id].loopTripCnt = loop_tripcount;
 }
+
+//EXTERN void __tgt_target_data_declare(int64_t device_id)
+EXTERN void __tgt_target_data_declare_begin() {
+  int64_t device_id = OFFLOAD_DEVICE_DEFAULT;
+  if (device_id == OFFLOAD_DEVICE_DEFAULT) {
+    device_id = omp_get_default_device();
+  }
+  if (CheckDeviceAndCtors(device_id) != OFFLOAD_SUCCESS) {
+    DP("Failed to get device %" PRId64 " ready\n", device_id);
+    HandleTargetOutcome(false);
+    return;
+  }
+  //printf("using device_id %d\n", device_id);
+  if (getenv("OMP_MASK")) {
+    mymalloc_begin(device_id);
+  }
+}
+EXTERN void __tgt_target_data_declare_end() {
+  if (getenv("OMP_MASK")) {
+    mymalloc_end();
+  }
+}

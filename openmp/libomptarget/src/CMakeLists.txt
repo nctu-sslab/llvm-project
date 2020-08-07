@@ -22,10 +22,16 @@ set(src_files
   segment.cpp
   perf.cpp
   rttype.cpp
+
+  mymalloc/mem_layout.cpp
+  mymalloc/mmap_mgr.cpp
+  mymalloc/mymalloc.cpp
 )
 
 # Build libomptarget library with libdl dependency.
 add_library(omptarget SHARED ${src_files})
+include_directories(mymalloc)
+include_directories(./)
 target_link_libraries(omptarget
   ${CMAKE_DL_LIBS}
   "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports")

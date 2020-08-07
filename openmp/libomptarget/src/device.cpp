@@ -21,6 +21,7 @@
 #include <string>
 
 #include <unistd.h>
+#include <string.h>
 
 /// Map between Device ID (i.e. openmp device id) and its DeviceTy.
 DevicesTy Devices;
@@ -227,7 +228,12 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         tp = 0;
       }
     } else {
-      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+      if (IsMaskEnabled && _MYMALLOC_ISMYSPACE(HstPtrBegin)) {
+        tp = (uintptr_t)_MYMALLOC_H2D(HstPtrBegin);
+        DP2("Skip alloc mem already in myspace: %p->%p\n", HstPtrBegin, (void*)tp);
+      } else {
+        tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
+      }
     }
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
@@ -299,7 +305,7 @@ int DeviceTy::deallocTgtPtr(void *HstPtrBegin, int64_t Size, bool ForceDelete) {
       assert(HT.RefCount == 0 && "did not expect a negative ref count");
       DP("Deleting tgt data " DPxMOD " of size %ld\n",
           DPxPTR(HT.TgtPtrBegin), Size);
-      if (!IsBulkEnabled) {
+      if (!IsBulkEnabled && !_MYMALLOC_ISMYSPACE(HstPtrBegin)) {
         RTL->data_delete(RTLDeviceID, (void *)HT.TgtPtrBegin);
       }
       DP("Removing%s mapping with HstPtrBegin=" DPxMOD ", TgtPtrBegin=" DPxMOD
@@ -328,25 +334,42 @@ void DeviceTy::init() {
     string EnabledOpt;
     IsBulkEnabled = false;
     IsATEnabled = false;
+    IsNoBulkEnabled = false;
+    IsMaskEnabled = false;
     EnabledOpt.append(" Offloading");
+    if (getenv("OMP_MASK")) {
+      if (RTL->set_mode) {
+        int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_MASK);
+        EnabledOpt.append(" AT_MASK");
+        IsMaskEnabled = true;
+        goto skip;
+      } else {
+        fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
+      }
+    }
     if (getenv("OMP_BULK") || getenv("OMP_AT")) {
       EnabledOpt.append(" BulkTransfer");
       IsBulkEnabled = true;
     }
+    if (getenv("OMP_NOBULK")) {
+      EnabledOpt.append(" NoBulkTransfer");
+      IsNoBulkEnabled = true;
+    }
     if (getenv("OMP_AT")) {
       if (RTL->set_mode) {
-        int32_t ret = RTL->set_mode(OMP_OFFMODE_ADDR_TRANS);
+        int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_TABLE);
         EnabledOpt.append(" AddrTranslate");
         IsATEnabled = true;
       } else {
         fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
       }
     }
+skip:
     if (getenv("PERF")) {
       Perf.init();
       EnabledOpt.append(" OmpProfiling");
     }
-    fprintf(stderr, "[omp-dc]%s Enabled\n", EnabledOpt.c_str());
+    fprintf(stdout, "[omp-dc]%s Enabled\n", EnabledOpt.c_str());
     IsInit = true;
   }
 }
@@ -419,28 +442,77 @@ int32_t DeviceTy::suspend_update(void *HstPtrBaseAddr, void *HstPtrValue, uint64
 int32_t DeviceTy::update_suspend_list() {
   int32_t ret;
 
+  list<HostDataToTargetListTy::iterator> HostShadows;
+
   int i = 0;
+  // FIXME incorrect update pointer method
   while (!UpdatePtrList.empty()) {
     PERF_WRAP(Perf.UpdatePtr.start();)
     struct UpdatePtrTy &upt = UpdatePtrList.front();
-    void *PtrBaseAddr, *PtrValue, *PtrValueBegin;
-    PtrBaseAddr = bulkGetTgtPtrBegin(upt.PtrBaseAddr,sizeof(void*));
-    PtrValueBegin = bulkGetTgtPtrBegin(upt.PtrValue,sizeof(void*));
-    PtrValue = (void*)((uintptr_t)PtrValueBegin - upt.Delta);
-    DP2("Update target pointer:" DPxMOD " to val:" DPxMOD "\n", DPxPTR(PtrBaseAddr), DPxPTR(PtrValue));
-    ret = data_submit(PtrBaseAddr,  &PtrValue, sizeof(void*));
-    if (ret) {
-      DP2("Update_suspend_list failed\n");
-      return ret;
+    void *TgtPtrBaseAddr, *TgtPtrValue, *TgtPtrValueBegin;
+    TgtPtrBaseAddr = bulkGetTgtPtrBegin(upt.PtrBaseAddr,sizeof(void*));
+    TgtPtrValueBegin = bulkGetTgtPtrBegin(upt.PtrValue,sizeof(void*));
+    TgtPtrValue = (void*)((uintptr_t)TgtPtrValueBegin - upt.Delta);
+//#ifndef HOST_SHADOW_PTR
+    if (OptNoHostShadow) {
+      DP2("Update target pointer:" DPxMOD " to val:" DPxMOD "\n", DPxPTR(TgtPtrBaseAddr), DPxPTR(TgtPtrValue));
+      ret = data_submit(TgtPtrBaseAddr,  &TgtPtrValue, sizeof(void*));
+      if (ret) {
+        DP2("Update_suspend_list failed\n");
+        //return ret;
+      }
+    } else {
+      // find PtrBaseAddr
+      void *BaseAddrHost = upt.PtrBaseAddr;
+      DP2("HOST_SHADOW_PTR\n");
+      auto r = lookupMapping(upt.PtrBaseAddr, sizeof(void*));
+      auto entry = r.Entry;
+
+      if (!r.Flags.IsContained) {
+        fprintf(stderr, "update_suspend_list failed\n");
+        return -1;
+      }
+      // alloc a space for host shadow pointer array if there is not
+      if (!entry->HostShadowPtrSpace) {
+        size_t size = entry->HstPtrEnd - entry->HstPtrBegin;
+        void *NewSpace = malloc(size);
+        entry->HostShadowPtrSpace = (void**)NewSpace;
+        memcpy(NewSpace, (void*)entry->HstPtrBegin, size);
+        HostShadows.push_back(entry);
+      }
+
+      // update the pointer
+      intptr_t offset = (intptr_t)BaseAddrHost - entry->HstPtrBegin;
+      intptr_t shadow = ((intptr_t) entry->HostShadowPtrSpace + offset);
+      DP2("offset: %zu ptrbase: %p ptr: %p\n", (size_t)offset,
+          (void*)shadow, TgtPtrValue);
+      *(void**)shadow = TgtPtrValue;
     }
     ShadowMtx.lock();
-    ShadowPtrMap[upt.PtrBaseAddr] = {upt.HstPtrBase, PtrBaseAddr,PtrValue};
+    ShadowPtrMap[upt.PtrBaseAddr] = {upt.HstPtrBase, TgtPtrBaseAddr,TgtPtrValue};
     ShadowMtx.unlock();
 
-    //UpdatePtrList.pop_front();
     UpdatePtrList.pop();
     ++i;
     PERF_WRAP(Perf.UpdatePtr.end();)
+  }
+
+  if (!OptNoHostShadow) {
+    // Transfer pointer bulks
+    while (!HostShadows.empty()) {
+      auto entry = HostShadows.front();
+      void *src = entry->HostShadowPtrSpace;
+      void *dst = bulkGetTgtPtrBegin((void*)entry->HstPtrBegin,sizeof(void*));
+      size_t size = entry->HstPtrEnd - entry->HstPtrBegin;
+      DP2("Update host shadow pointers  h%p(%zu) -> d%p\n", src, size, dst);
+      ret = data_submit(dst,  src, size);
+      if (ret) {
+        DP2("Update_suspend_list failed\n");
+        return ret;
+      }
+      free(src);
+      HostShadows.pop_front();
+    }
   }
   return 0;
 }
@@ -573,6 +645,9 @@ void DeviceTy::table_transfer() {
 int32_t DeviceTy::bulk_data_alloc(void *HstPtrBegin, size_t Size) {
   if (!Size) {
     return OFFLOAD_FAIL;
+  }
+  if (IsNoBulkEnabled) {
+
   }
   intptr_t threshold = getpagesize();
   intptr_t HstPtrBeginNew = (intptr_t) HstPtrBegin;
@@ -736,7 +811,7 @@ BulkLookupResult DeviceTy::bulkLookupMapping(void *HstPtrBegin, int64_t Size) {
     // TODO lower latency
     auto entry = SegmentList.lower_bound((intptr_t)HstPtrBegin);
     if (entry != SegmentList.end()) {
-        DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
+        //DP2("[%p, %p]\n", (void*)entry->second.HstPtrBegin, (void*) entry->second.HstPtrEnd);
       if ((intptr_t) HstPtrBegin < entry->second.HstPtrEnd) {
         if ((intptr_t) HstPtrBegin + Size <= entry->second.HstPtrEnd) {
           r.Flags.IsContained = true;

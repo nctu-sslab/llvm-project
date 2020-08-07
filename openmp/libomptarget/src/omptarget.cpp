@@ -30,6 +30,8 @@ int DebugLevel = 0;
 int DebugLevel2 = 0;
 #endif // OMPTARGET_DEBUG
 
+int OptNoHostShadow = 0;
+
 /* All begin addresses for partially mapped structs must be 8-aligned in order
  * to ensure proper alignment of members. E.g.
  *
@@ -354,6 +356,9 @@ DCGEN_REPEAT:
       }
     }
 
+    if (Device.IsMaskEnabled) {
+      goto skip_update;
+    }
     if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       PERF_WRAP(Perf.UpdatePtr.start();)
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
@@ -373,7 +378,7 @@ DCGEN_REPEAT:
       Device.ShadowMtx.unlock();
       PERF_WRAP(Perf.UpdatePtr.end();)
     }
-
+skip_update:
     if (data_type & OMP_TGT_MAPTYPE_NESTED) {
       goto DCGEN_REPEAT;
     }
@@ -599,6 +604,7 @@ DCGEN_REPEAT:
       }
     }
     DP2("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
+    DP("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", HstPtrBase, HstPtrBegin, data_size, data_type);
     // Adjust for proper alignment if this is a combined entry (for structs).
     // Look at the next argument - if that is MEMBER_OF this one, then this one
     // is a combined entry.
@@ -738,7 +744,7 @@ int target_data_update(DeviceTy &Device, int32_t arg_num,
         (arg_types[i] & OMP_TGT_MAPTYPE_PRIVATE))
       continue;
 
-    printf("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", args_base[i],
+    DP("Base: %p Ptr: %p size: %" PRId64 " type: 0x%lx\n", args_base[i],
         args[i], arg_sizes[i], arg_types[i]);
     void *HstPtrBegin = args[i];
     int64_t MapSize = arg_sizes[i];
@@ -897,7 +903,9 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   }
 
   if (Device.IsBulkEnabled) {
-    Device.bulk_transfer();
+    if (!Device.IsNoBulkEnabled) {
+      Device.bulk_transfer();
+    }
     Device.dump_segmentlist();
     //Device.dump_map();
 
@@ -1029,6 +1037,10 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     } else {
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
+      if (Device.IsMaskEnabled && _MYMALLOC_ISMYSPACE(HstPtrBegin)) {
+        DP2("omp target launching with myspace arg: %p->%p\n",
+            HstPtrBegin, TgtPtrBegin);
+      }
       if (Device.IsBulkEnabled) {
         DP2("IsBulkEnabled 2\n");
         TgtPtrBegin = Device.bulkGetTgtPtrBegin(HstPtrBegin, arg_sizes[i]);
@@ -1064,6 +1076,12 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     for (int i = 0; i < size; i++) {
       TmpTable[i].dump();
     }*/
+  }
+  // Insert Mask
+  if (Device.IsMaskEnabled) {
+    DP2("Append h2d mask %p to kernel\n", (void*&)_omp_h2dmask);
+    tgt_args.push_back((void*)_omp_h2dmask);
+    tgt_offsets.push_back(0);
   }
 
   assert(tgt_args.size() == tgt_offsets.size() &&

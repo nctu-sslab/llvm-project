@@ -16,6 +16,7 @@
 #include <omptarget.h>
 #include <cstdint>
 #include "device.h"
+#include "mymalloc.h"
 
 static int bulk_target_data_begin(DeviceTy &Device, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types);
@@ -72,6 +73,8 @@ int __kmpc_get_target_offload(void) __attribute__((weak));
 #ifdef __cplusplus
 }
 #endif
+
+extern int OptNoHostShadow;
 
 #ifdef OMPTARGET_DEBUG
 extern int DebugLevel;

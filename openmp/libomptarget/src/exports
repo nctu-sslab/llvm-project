@@ -23,6 +23,12 @@ VERS1.0 {
     omp_target_associate_ptr;
     omp_target_disassociate_ptr;
     __kmpc_push_target_tripcount;
+    __tgt_target_data_declare_begin;
+    __tgt_target_data_declare_end;
+
+    malloc;
+    free;
+    calloc;
   local:
     *;
 };

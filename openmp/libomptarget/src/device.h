@@ -39,16 +39,18 @@ struct HostDataToTargetTy {
 
   mutable uintptr_t TgtPtrBegin; // target info.
 
+  mutable void** HostShadowPtrSpace;
+
   mutable long RefCount;
   HostDataToTargetTy()
-      : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0),
+      : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0), HostShadowPtrSpace(NULL),
         TgtPtrBegin(0), RefCount(0) {}
   HostDataToTargetTy(uintptr_t BP, uintptr_t B, uintptr_t E, uintptr_t TB)
-      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E),
+      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), HostShadowPtrSpace(NULL),
         TgtPtrBegin(TB), RefCount(1) {}
   HostDataToTargetTy(uintptr_t BP, uintptr_t B, uintptr_t E, uintptr_t TB,
       long RF)
-      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E),
+      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), HostShadowPtrSpace(NULL),
         TgtPtrBegin(TB), RefCount(RF) {}
 };
 
@@ -228,7 +230,9 @@ struct DeviceTy {
   SegmentListTy SegmentList;
 
   bool IsBulkEnabled;
+  bool IsNoBulkEnabled;
   bool IsATEnabled;
+  bool IsMaskEnabled;
   int32_t suspend_update(void *HstPtrAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase);
   int32_t update_suspend_list();
   int32_t dump_segmentlist();

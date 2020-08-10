@@ -12,6 +12,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/CallGraph.h"
@@ -53,8 +54,9 @@ using namespace std;
 // TODO What if it is a pointer data which will also be traced
 namespace {
   bool IsDebug = false;
-  bool IsNaiveAT = false;
+//  bool IsNaiveAT = false;
   bool EnableAS = false;
+  bool DisableFakeLoad = false;
   int InsertedATCount = 0;
 
   raw_ostream &dp() {
@@ -67,21 +69,32 @@ namespace {
       return null_ostream;
     }
   }
-  // NOTE sync this data struct
+  // NOTE sync this data struct with OMP libtarget runtime
   struct ATTableTy {
     uintptr_t HstPtrBegin;
     uintptr_t HstPtrEnd;
     uintptr_t TgtPtrBegin;
   };
+  enum ATVer {
+    OMP_AT_TABLE,
+    OMP_AT_MASK
+  };
+  typedef map<ATVer, Function*> ATFunctionSet;
   const int MaxATTableSize = 20;
   const int ATTableEntyNum = sizeof(struct ATTableTy) / sizeof(uintptr_t);
 
+  struct InfoPerFunc {
+    set<User*> TracedUserList;
+    map<Instruction*, Instruction*> TranslatedResult;
+    set<LoadInst*> LoadInstListReplacing;
+  };
+
   class OmpTgtAddrTrans : public ModulePass {
 
-    typedef  map<Function*, Function*> FunctionMapTy;
+    typedef  map<Function*, ATFunctionSet> FunctionMapTy;
 
     FunctionMapTy FunctionTransEntry; // Entry Functions after Transform
-    FunctionMapTy FunctionTrans; // Functions after Transform
+    FunctionMapTy FunctionTrans; // Other functions Transform mapping
 
     // Types
     // intptr_t
@@ -96,15 +109,23 @@ namespace {
     // void *
     PointerType *AddrType;
 
-    Function *ATFunc;
+    Function *ATFuncTable;
     Function *StoreTableFunc;
+    Function *ATFuncMask;
+    Function *StoreMaskFunc;
 
     // llvm Module
     Module *module;
     LLVMContext *context;
 
+    // AT mode
+    ATVer CurATMode;
+
+    // Metadatas
+    MDNode *ATMD;
+
     // UserList per Function
-    map<Function*,set<User*>> AllUserList;
+    map<Function*, InfoPerFunc> AllUserList;
  //   MemoryDependenceResults *MD;
 
     unique_ptr<raw_fd_ostream> db_ostream;
@@ -117,21 +138,23 @@ namespace {
       llvm::initializeOmpTgtAddrTransPass(*PassRegistry::getPassRegistry());
 #endif
     }
+    virtual StringRef getPassName() const override {return "OmpTgtAddrTrans";};
     private:
-    Argument *getFuncTableArg(Function *F);
+    Argument *getATArg(Function *F);
     int8_t init(Module &M);
-    Function *cloneFuncWithATArg(Function *F);
+    ATFunctionSet cloneFuncWithATArg(Function *F);
+    Function *cloneFuncWithATArgByVer(Function *F, enum ATVer);
     void getCalledFunctions(FunctionMapTy &F, Function *T, CallGraph &CG);
     void addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs);
-    CallInst *swapCallInst(CallInst *CI);
+    CallInst *swapCallInst(CallInst *CI, ATVer Opt);
     void eraseFunction(FunctionMapTy FunctionTrans, Function* F);
     bool runOnModule(Module &M) override;
     void getAnalysisUsage(AnalysisUsage &AU) const override;
-    void naiveAT(Function *);
+//    void naiveAT(Function *);
     vector<Value *> getSourceValues(User *U);
-    void traceArgInFunc(Function *, Argument*);
-    bool isATFunction(Function *Func);
-    void insertATFuncBefore(Instruction *I, Value *Ptr, set<User*> &UserList);
+    void traceArgInFunc(Function *, Argument*, ATVer Opt);
+    //Instruction *insertATFuncBefore(Instruction *I, Value *Ptr, set<User*> &UserList);
+    Instruction *insertATFuncAfter(Value *V, set<User*> &UserList, bool DoReplaceAll = false);
 
     unsigned getPtrDepth(Type *T);
     bool typeContainPtr(Type *T);
@@ -142,18 +165,55 @@ namespace {
     DominatorTree &getDomTree(Function *F);
     void getEntryFuncs(FunctionMapTy &EntryList);
     int16_t doSharedMemOpt();
+    Function *genFakeLoadFunc(LoadInst *LI);
+    Function *replaceLoad(LoadInst *LI);
+    void epilogue();
 
     // Helper function
     string printFunction(Function *F);
   };
+
+  class RestoreLoad : public ModulePass {
+  public:
+    static char ID;
+    RestoreLoad(): ModulePass(ID) {
+#ifndef LLVM_MODULE
+      llvm::initializeRestoreLoadPass(*PassRegistry::getPassRegistry());
+#endif
+    }
+    bool runOnModule(Module &M) override;
+  private:
+    bool restoreLoad(CallInst *CI);
+
+  };
+
+  class ConcurrentAT : public ModulePass {
+  public:
+    static char ID;
+    Intrinsic::ID NvvmTidIID, NvvmCtaidIID;
+    Function *ATFuncTable;
+    Function *ATFuncMask;
+    bool HasError;
+    ConcurrentAT(): ModulePass(ID) {
+#ifndef LLVM_MODULE
+      //llvm::initializeConcurrentATPass(*PassRegistry::getPassRegistry());
+#endif
+    }
+    bool runOnModule(Module &M) override;
+  private:
+    int doConcurrentAT(Function *);
+    bool init(Module &M);
+
+  };
 }
 
 int8_t OmpTgtAddrTrans::init(Module &M) {
+  /*
   if (IsNaiveAT) {
     llvm::errs() << "Naive Address Translation enabled\n";
-  }
+  }*/
 
-  //errs() << "OmpTgtAddrTransPass is called\n";
+  //errs() << "OmpTgtAddrTrans is called\n";
   module = &M;
   context = &M.getContext();
 
@@ -163,15 +223,27 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
     //return FAILED;
   }
   // Use a metadata to avoid double application
-  if (M.getNamedMetadata("omp_offload.addrtranspass")) {
-    errs() << "Metadata omptgtaddrtrans already exist!\n";
+  string PassMetadata("omp_offload.OmpTgtAddrTrans");
+  if (M.getNamedMetadata(PassMetadata)) {
+    errs() << "Metadata " << PassMetadata << " already exist!\n";
     return FAILED;
   } else if (!M.getNamedMetadata("nvvm.annotations")) {
     errs() << "Error no nvvm.annotations metadata found!\n";
     return FAILED;
   } else {
-    M.getOrInsertNamedMetadata("omp_offload.addrtranspass");
+    auto *MD =M.getOrInsertNamedMetadata(PassMetadata);
+    // Insert time and date
+    //#include <time.h>
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    string timestamp;
+    timestamp += to_string(tm.tm_mon + 1) + to_string(tm.tm_mday) +
+      to_string(tm.tm_hour) + to_string(tm.tm_min);
+    MD->addOperand(MDNode::get(*context, MDString::get(*context, timestamp)));
   }
+
+  // Set AT function metadata
+  ATMD = MDNode::get(*context, MDString::get(*context, "ompat"));
 
   DataLayout DL(&M);
   // Init IntegerType
@@ -189,29 +261,144 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
       "struct.ATTableTy", false);
   ATTablePtrType = PointerType::getUnqual(ATTableType);
 
-  // Create Address Translation function
+  // Create Address Translation function (table ver)
   AddrType = PointerType::get(IT8, 0);
   vector<Type*> ParamTypes;
   ParamTypes.push_back(AddrType);
-  ParamTypes.push_back(ATTablePtrType);
-  FunctionType *ATFuncTy = FunctionType::get(AddrType, ParamTypes, false);
-  ATFunc = Function::Create(ATFuncTy, GlobalValue::ExternalLinkage,
-      "AddrTrans", M);
+  FunctionType *ATFuncTableTy = FunctionType::get(
+      AddrType, ParamTypes, false);
+  ATFuncTable = Function::Create(
+      ATFuncTableTy, GlobalValue::ExternalLinkage, "AddrTransTable", M);
+  // Set pure function attribute to open optimization
+  ATFuncTable->addFnAttr(Attribute::ReadNone);
+
+  // Create AT func (mask ver)
+  ATFuncMask = Function::Create(
+      ATFuncTableTy, GlobalValue::ExternalLinkage, "AddrTransMask", M);
+  ATFuncMask->addFnAttr(Attribute::ReadNone);
 
   //struct ATTableTy *StoreTableShared(
   //    struct ATTableTy*, struct ATTableTy *sm, int16_t, int32_t)
   ParamTypes.clear();
   ParamTypes.push_back(ATTablePtrType);
+  /*
   ParamTypes.push_back(ATTablePtrType);
   ParamTypes.push_back(IT8);
   ParamTypes.push_back(IT32);
+  */
   FunctionType *STSFuncTy = FunctionType::get(ATTablePtrType, ParamTypes, false);
   StoreTableFunc = Function::Create(STSFuncTy, GlobalValue::ExternalLinkage,
       "StoreTableShared", M);
+  FunctionType *SMFTy = FunctionType::get(Type::getVoidTy(*context),
+      ITptr, false);
+  StoreMaskFunc = Function::Create(SMFTy, GlobalValue::ExternalLinkage,
+      "StoreMaskShared", M);
 
   // Get analysis
   //MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
   return SUCCESS;
+}
+
+void OmpTgtAddrTrans::epilogue() {
+  // TODO insert the AT functions at the end??
+  dp() << "Epilogue\n";
+  /*
+   * Cannot reuse result by my self
+  for (auto &F : module) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (I.getMetaData("ompat")) {
+          // Insert AT here
+          I.dump();
+        }
+      }
+    }
+  }
+  */
+  // replace the load insts to readnone function for further opt
+  if (DisableFakeLoad) {
+    return;
+  }
+  for (auto &e : AllUserList) {
+    auto &LoadInstListReplacing = e.second.LoadInstListReplacing;
+    for (auto LI : LoadInstListReplacing) {
+      replaceLoad(LI);
+    }
+  }
+}
+
+static bool isRelated(Value *V, set<Value*> &RelatedValues, int limit = 0) {
+  if (!isa<Instruction>(V)) {
+    return false;
+  }
+  if (limit > 50) {
+    errs() << "[ConcurrentAT] isRelated recursive limit reached\n";
+    return true;
+  }
+  User *U = dyn_cast<User>(V);
+  for (auto use : U->operand_values()) {
+    if (RelatedValues.find(use) != RelatedValues.end()) {
+      return true;
+    }
+    if (isRelated(use, RelatedValues, limit+1)) {
+      RelatedValues.insert(V);
+      return true;
+    }
+  }
+  return false;
+}
+
+int ConcurrentAT::doConcurrentAT(Function *F) {
+  errs() << "Run doConcurrentAT on " << F->getName() << "\n";
+  int mergedCall = 0;
+
+  // Get idx first
+  set<Value*> TidRelatedValues;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(&I)) {
+        if (II->getIntrinsicID() == NvvmTidIID) {
+          TidRelatedValues.insert(II);
+          continue;
+        } else if (II->getIntrinsicID() == NvvmCtaidIID) {
+          TidRelatedValues.insert(II);
+          continue;
+        }
+      }
+    }
+  }
+  errs() << "dump TidRelatedValues\n";
+  for (auto &V : TidRelatedValues) {
+    V->dump();
+  }
+  for (auto &BB : *F) {
+    int ATCallCount = 0;
+    SmallVector<CallInst*, 4> ATs;
+    for (auto &I : BB) {
+      if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+        if (isa<IntrinsicInst>(CI)) {
+          continue;
+        }
+        Function *Callee = CI->getCalledFunction();
+        if (Callee == ATFuncTable) {
+          CI->dump();
+          bool ret = isRelated(CI, TidRelatedValues);
+          if (ret) {
+            errs() << "Is Related\n";
+          } else {
+            errs() << "Not Related\n";
+          }
+          ATCallCount++;
+          ATs.push_back(CI);
+        }
+      }
+    }
+    /*
+    for (auto &V : ATs) {
+      V->dump();
+    }*/
+  }
+  return mergedCall;
 }
 
 // Print function with Arg
@@ -233,8 +420,9 @@ DominatorTree &OmpTgtAddrTrans::getDomTree(Function *F) {
   return getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
 }
 
-bool OmpTgtAddrTrans::isATFunction(Function *Func) {
-  if (Func->getName().endswith("AT")) {
+static bool isATFunction(Function *Func) {
+  // FIXME Add metadata
+  if (Func->hasFnAttribute("omp-at-func")) {
     return true;
   }
   return false;
@@ -283,7 +471,14 @@ bool OmpTgtAddrTrans::mayContainHostPtr(Value *V) {
 
 // Param
 // TODO kernel need to have some attribute nvvm annotation
-Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
+ATFunctionSet OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
+  ATFunctionSet ret;
+  ret[OMP_AT_TABLE]  = cloneFuncWithATArgByVer(F, OMP_AT_TABLE);
+  ret[OMP_AT_MASK]   = cloneFuncWithATArgByVer(F, OMP_AT_MASK);
+  return ret;
+}
+
+Function * OmpTgtAddrTrans::cloneFuncWithATArgByVer(Function *F, ATVer Opt) {
   // TODO
   vector<Type*> ArgsType;
   // Assert if target function is va_arg
@@ -296,20 +491,33 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
     Type *T = arg.getType();
     if (EnableAS) {
       if (mayContainHostPtr(&arg)) {
-        dp() << "cloning function with new addressspace";
+        dp() << "Warning! cloning function with new addressspace";
         arg.dump();
         T = addAddrSpace(T);
       }
     }
     ArgsType.push_back(T);
   }
-  ArgsType.push_back(ATTablePtrType);
+
+  string posfix;
+  switch (Opt) {
+    case OMP_AT_TABLE:
+      posfix = "_AT_TABLE";
+      ArgsType.push_back(ATTablePtrType);
+      break;
+    case OMP_AT_MASK:
+      posfix = "_AT_MASK";
+      // uintptr_t
+      ArgsType.push_back(ITptr);
+      break;
+  }
+
   FunctionType *FT = FunctionType::get(F->getReturnType(), ArgsType, false);
   Twine FuncName(F->getName());
 
   // insert new Function
   Function *NewFunc = Function::Create(FT, F->getLinkage(),
-      F->getAddressSpace(), FuncName.concat("_AT"), F->getParent());
+      F->getAddressSpace(), FuncName.concat(posfix), F->getParent());
 
   // ValueMap for args
   VMap[F] = NewFunc;
@@ -320,12 +528,20 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
       VMap[&arg] = &*NewArgs++;
     }
   }
-  // Add name to new args
-  NewArgs->setName("__ATtable");
-  //NewArgs->setName("__table_size");
-  SmallVector<ReturnInst *, 8> Returns; // Ignore returns cloned.
+
+  // Set additional args name, NewArgs point to new arg
+  switch (Opt) {
+    case OMP_AT_TABLE:
+      NewArgs->setName("_AT_Table");
+      //NewArgs->setName("__table_size");
+      break;
+    case OMP_AT_MASK:
+      NewArgs->setName("_AT_Mask");
+      break;
+  }
 
   // Clone body
+  SmallVector<ReturnInst *, 8> Returns; // Ignore returns cloned.
   CloneFunctionInto(NewFunc, F, VMap, /*ModuleLevelChanges=*/true, Returns);
   if (EnableAS) {
     for (size_t i = 0; i < F->arg_size();i ++) {
@@ -336,11 +552,14 @@ Function *OmpTgtAddrTrans::cloneFuncWithATArg(Function *F) {
       }
     }
   }
+  // TODO add attribute
+  NewFunc->addFnAttr("omp-at-func");
   dp() << "Clone Function \"" << printFunction(F) << "\"\n\tto \""
     << printFunction(NewFunc) << "\"\n";
   return NewFunc;
 }
 
+/*
 void OmpTgtAddrTrans::naiveAT(Function *F) {
   // FIXME only once per function function
   static set<Function*> FunctionTransed;
@@ -393,9 +612,8 @@ void OmpTgtAddrTrans::naiveAT(Function *F) {
         } else if (Callee->isIntrinsic()) {
           continue;
         }
-        /*(
+        (
         } else if (CallInst-> what if no body??
-        */
         CallInst *NewCallee = swapCallInst(CI);
         naiveAT(NewCallee->getCalledFunction());
       } else if (!doInsert) {
@@ -419,7 +637,7 @@ void OmpTgtAddrTrans::naiveAT(Function *F) {
     }
   }
   dp() << "END Func " << name << " Inserted " << MemoryInstCount << " AT\n";
-}
+}*/
 
 string getValStr(Value *V, bool dump = false) {
   string ret;
@@ -451,7 +669,8 @@ vector<Value *> OmpTgtAddrTrans::getSourceValues(User *U) {
 
 std::unordered_set<Argument*> TracedArgs;
 // Arg is CPU addr, keep trace it and insert AT function
-void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
+void OmpTgtAddrTrans::traceArgInFunc(
+    Function *Func, Argument *Arg, ATVer Opt) {
   // TODO Insert and Delete all together at the end
   // TODO what if passed GPU variable address
   //    -> AT function won't work if of out range
@@ -476,7 +695,11 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
   queue<PtrInfo> Vals; // Value waiting for tracing
   // TODO keep this as per-function list??
 
-  set<User*> &UserList = AllUserList[Func]; // User that has been checked
+  InfoPerFunc &Info = AllUserList[Func];
+
+  auto &UserList = Info.TracedUserList;
+  //auto &TranslatedResult = Info.TranslatedResult;
+  auto &LoadInstListReplacing = Info.LoadInstListReplacing;
   // TODO Possible that have to be checked multiple time??
 
   if (!isATFunction(Func)) {
@@ -497,6 +720,7 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
     PtrInfo Val = Vals.front();
     // TODO check only Vals is in this function
     Value *V = Val.V;
+    Instruction *TranslatedAddr = NULL;
     unsigned Depth = Val.DevicePtrDepth;
     Vals.pop();
     if (!V) {
@@ -512,6 +736,13 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
     dp() << "\n  Trace depth: " << Depth << " value: "
       << getValStr(V) << "\n";
 
+    // Add debug metadata
+    if (true/*IsDebug*/) {
+      if (Instruction *I = dyn_cast<Instruction>(V)) {
+        string prefix = "depth";
+        I->setMetadata(prefix + to_string(Depth), ATMD);
+      }
+    }
     if (User *self = dyn_cast<User>(V)) {
       /*
       dp() << ">>>>>>>>>>>>>>>>>>>>>>nserlist: \n";
@@ -573,7 +804,12 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         // Store has two oprand
         if (SI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
-            insertATFuncBefore(SI, V, UserList);
+            if (!TranslatedAddr) {
+              // FIXME check dominate
+              TranslatedAddr = insertATFuncAfter(V, UserList);
+              //TranslatedResult[V] = TransResult;
+            }
+            SI->replaceUsesOfWith(V, TranslatedAddr);
             changed = true;
             // TODO replace further load/ store?
           }
@@ -584,18 +820,28 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
           Vals.push({SI->getPointerOperand(), Depth + 1, SI});
         }
       } else if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
+        LoadInstListReplacing.insert(LI);
         if (Depth == 0) {
-          insertATFuncBefore(LI, V, UserList);
-          changed = true;
+          LI->setMetadata("ompat", ATMD);
+          if (!TranslatedAddr) {
+            TranslatedAddr = insertATFuncAfter(V, UserList);
+          }
+          LI->replaceUsesOfWith (V, TranslatedAddr);
+
           if (typeContainPtr(U->getType())) {
-            dp() << "\tLoadinst valContainPtr ";
-            dp() << "\n";
+            dp() << "\tLoadinst valContainPtr \n";
             Vals.push({U, 0});
           }
-        } else if (Depth > 0 && typeContainPtr(U->getType())) {
-          dp() << "\tLoadinst valContainPtr ";
-          dp() << "\n";
-          Vals.push({U, Depth - 1});
+          changed = true;
+        } else if (Depth > 0 && typeContainPtr(LI->getType())) {
+          dp() << "\tLoadinst valContainPtr \n";
+          if (Depth == 1) {
+            TranslatedAddr = insertATFuncAfter(LI, UserList, true);
+            changed = true;
+            Vals.push({TranslatedAddr, 1});
+          } else {
+            Vals.push({U, Depth - 1});
+          }
         }
       } else if (MemCpyInst *MI = dyn_cast<MemCpyInst>(U)) {
         // declare void @llvm.memcpy.p0i8.p0i8.i32 llvm.memcpy.p0i8.p0i8.i64
@@ -604,7 +850,10 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         if (ArgIdx == 1) { // this is a load
           Value *dst = MI->getArgOperand(0);
           if (Depth == 0) {
-            insertATFuncBefore(MI, V, UserList);
+            if (!TranslatedAddr) {
+              TranslatedAddr = insertATFuncAfter(V, UserList);
+            }
+            MI->replaceUsesOfWith (V, TranslatedAddr);
             changed = true;
             Vals.push({dst, 1, MI});
             // get dst come from
@@ -616,7 +865,10 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         } else if (ArgIdx == 0) { // this is a store
           // TODO
           if (Depth == 0) {
-            insertATFuncBefore(MI, V, UserList);
+            if (!TranslatedAddr) {
+              TranslatedAddr = insertATFuncAfter(V, UserList);
+            }
+            MI->replaceUsesOfWith (V, TranslatedAddr);
             changed = true;
           }
           // FIXME
@@ -629,16 +881,23 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
         // check if swap callinst
         unsigned ArgIdx = _U->getOperandNo();
         Function *F = CI->getCalledFunction();
+        if (F->isIntrinsic()) {
+          // skip
+          continue;
+        }
         if (!isATFunction(F)) {
-          CI = swapCallInst(CI);
+          CI = swapCallInst(CI, Opt);
           changed = true;
           F = CI->getCalledFunction();
         }
         if (Depth == 0) {
-          insertATFuncBefore(CI, V, UserList);
+          if (!TranslatedAddr) {
+            TranslatedAddr = insertATFuncAfter(V, UserList);
+          }
+          CI->replaceUsesOfWith (V, TranslatedAddr);
           changed = true;
         }
-        traceArgInFunc(F, F->arg_begin() + ArgIdx);
+        traceArgInFunc(F, F->arg_begin() + ArgIdx, Opt);
         if (typeContainPtr(CI->getType())) {
           dp() << "\tCallInst valContainPtr ";
           dp() << "Func " << Func->getName() << " arg: " ;
@@ -674,7 +933,10 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
       } else if (AtomicRMWInst *AI = dyn_cast<AtomicRMWInst> (U)) {
         if (AI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
-            insertATFuncBefore(AI, V, UserList);
+            if (!TranslatedAddr) {
+              TranslatedAddr = insertATFuncAfter(V, UserList);
+            }
+            AI->replaceUsesOfWith (V, TranslatedAddr);
             changed = true;
           }
         }
@@ -682,7 +944,10 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
       } else if (AtomicCmpXchgInst *ACXI = dyn_cast<AtomicCmpXchgInst>(U)) {
         if (ACXI->getPointerOperand() == dyn_cast<Value>(V)) {
           if (Depth == 0) {
-            insertATFuncBefore(ACXI, V, UserList);
+            if (!TranslatedAddr) {
+              TranslatedAddr = insertATFuncAfter(V, UserList);
+            }
+            ACXI->replaceUsesOfWith (V, TranslatedAddr);
             changed = true;
           }
         }
@@ -690,7 +955,10 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
       } else if (ReturnInst *RI= dyn_cast<ReturnInst>(U)) {
         // Return device addr
         if (Depth == 0) {
-          insertATFuncBefore(RI, V, UserList);
+          if (!TranslatedAddr) {
+            TranslatedAddr = insertATFuncAfter(V, UserList);
+          }
+          RI->replaceUsesOfWith (V, TranslatedAddr);
           changed = true;
         }
       } else {
@@ -732,9 +1000,11 @@ void OmpTgtAddrTrans::traceArgInFunc(Function *Func, Argument *Arg) {
 // Inst has to be in AT function
 // TODO Load only once for same addr
 //void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Use *PtrUse, set<User*> &UserList) {
-void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
+/*
+Instruction *OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
   InsertedATCount++;
-  Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
+  // old version
+  //Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
 
   dp () << "@Insert translate before Inst: ";
   Inst->print(dp());
@@ -748,18 +1018,103 @@ void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<
   // insert call
   vector<Value*> Args;
   Args.push_back(PreCastI);
-  Args.push_back(ATTableArg);
-  CallInst *CI = CallInst::Create(ATFunc->getFunctionType(), ATFunc,
+  // old version
+  //Args.push_back(ATTableArg);
+  CallInst *CI = CallInst::Create(->getFunctionType(), ,
       Args, "TransResult", Inst);
   // insert bitcast
   CastInst *PostCastI = CastInst::Create(Instruction::BitCast, CI,
       PtrAddr->getType(), "PostATCast", Inst);
   //Inst->replaceUsesOfWith (PtrUse->get(), PostCastI);
   Inst->replaceUsesOfWith (PtrAddr, PostCastI);
+  //PtrAddr->replaceAllUsesWith (PostCastI);
   UserList.insert(PreCastI);
   UserList.insert(CI);
   UserList.insert(PostCastI);
+  return PostCastI;
+}*/
+
+Instruction *OmpTgtAddrTrans::insertATFuncAfter(Value *V, set<User*> &UserList,
+    bool DoReplaceAll) {
+  Instruction *Inst = dyn_cast<Instruction>(V);
+  InsertedATCount++;
+  dp () << "@Insert translate after Inst: ";
+  Inst->print(dp());
+  dp() << "\n";
+  // insert bitcast
+  // Dummy cast as tmp for replace all
+  Instruction *DummyInst;
+  if (DoReplaceAll) {
+    DummyInst = new BitCastInst(Inst, Inst->getType(), "dummy", Inst);
+    Inst->replaceAllUsesWith(DummyInst);
+  }
+  CastInst *PreCastI = CastInst::Create(Instruction::BitCast, Inst,
+      AddrType, "PreATCast");
+
+  // insert call
+  vector<Value*> Args;
+  Args.push_back(PreCastI);
+  CallInst *CI = NULL;
+  if (CurATMode == OMP_AT_TABLE) {
+    CI = CallInst::Create(ATFuncTable->getFunctionType(), ATFuncTable,
+        Args, "TransResult");
+  } else if (CurATMode == OMP_AT_MASK) {
+    CI = CallInst::Create(ATFuncMask->getFunctionType(), ATFuncMask,
+        Args, "TransResult");
+  }
+  // insert bitcast
+  CastInst *PostCastI = CastInst::Create(Instruction::BitCast, CI,
+      V->getType(), "PostATCast");
+
+  PostCastI->insertAfter(Inst);
+  CI->insertAfter(Inst);
+  PreCastI->insertAfter(Inst);
+
+  if (DoReplaceAll) {
+    // FIXME testing no parent inst
+    DummyInst->replaceAllUsesWith(PostCastI);
+    DummyInst->dropAllReferences();
+    DummyInst->eraseFromParent();
+  } else {
+    Inst->replaceUsesOfWith (V, PostCastI);
+  }
+
+  UserList.insert(PreCastI);
+  UserList.insert(CI);
+  UserList.insert(PostCastI);
+  return PostCastI;
 }
+
+/*
+Instruction *OmpTgtAddrTrans::insertATFuncAfter(Value *V) {
+  Instruction *Inst = dyn_cast<Instruction>(V);
+  InsertedATCount++;
+  dp () << "@Insert translate after Inst: ";
+  Inst->print(dp());
+  dp() << "\n";
+  // Get bb
+  BasicBlock *BB = Inst->getParent();
+  // insert bitcast
+  CastInst *PreCastI = CastInst::Create(Instruction::BitCast, Inst,
+      AddrType, "PreATCast");
+
+  // insert call
+  vector<Value*> Args;
+  Args.push_back(PreCastI);
+  CallInst *CI = CallInst::Create(->getFunctionType(), ,
+      Args, "TransResult");
+  // insert bitcast
+  CastInst *PostCastI = CastInst::Create(Instruction::BitCast, CI,
+      V->getType(), "PostATCast");
+
+  PostCastI->insertAfter(Inst);
+  CI->insertAfter(Inst);
+  PreCastI->insertAfter(Inst);
+
+  Inst->replaceUsesOfWith (V, PostCastI);
+
+  return PostCastI;
+}*/
 
 // Recursive
 // Store func called by Target function
@@ -795,16 +1150,19 @@ void OmpTgtAddrTrans::addEntryFunctionsAsKernel(FunctionMapTy &EntryFuncs) {
   // Append metadata of kernel entry to nvvm.annotations
   auto NvvmMeta = module->getNamedMetadata("nvvm.annotations");
   for (auto &E : EntryFuncs) {
-    Function *F = E.second;
-    vector<Metadata*> MetaList = PreMetaList;
-    MetaList.insert(MetaList.begin(), ValueAsMetadata::get(F));
-    MDTuple *node = MDNode::get(*context, MetaList);
-    NvvmMeta->addOperand(node);
+    ATFunctionSet &FS = E.second;
+    for (auto &Ver : FS) {
+      Function *F = Ver.second;
+      vector<Metadata*> MetaList = PreMetaList;
+      MetaList.insert(MetaList.begin(), ValueAsMetadata::get(F));
+      MDTuple *node = MDNode::get(*context, MetaList);
+      NvvmMeta->addOperand(node);
+    }
   }
 }
 
 // swap CallInst to call AT function
-CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI) {
+CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI, ATVer Opt) {
   // Check if callee is transformed
   Function *Callee = CI->getCalledFunction();
   if (isATFunction(Callee)) {
@@ -812,10 +1170,10 @@ CallInst *OmpTgtAddrTrans::swapCallInst(CallInst *CI) {
   } else if (FunctionTrans.find(Callee) == FunctionTrans.end()) {
     FunctionTrans[Callee] = cloneFuncWithATArg(Callee);
   }
-  Function *NewCallee = FunctionTrans[Callee];
+  Function *NewCallee = FunctionTrans[Callee][Opt];
 
   // Get table Arg of parent function
-  Argument *TableArg = getFuncTableArg(CI->getFunction());
+  Argument *TableArg = getATArg(CI->getFunction());
 
   // Get old arg
   vector<Value*> ArgsOfNew;
@@ -893,7 +1251,7 @@ THIRD:
     }
     if (auto *CAM = dyn_cast<ConstantAsMetadata>(MD->getOperand(2).get())) {
       if (CAM->getValue()->isOneValue()) {
-        EntryList[Entry] = NULL;
+        EntryList[Entry] = ATFunctionSet();
         dp() << "Entry Function: " << printFunction(Entry) << "\n";
       }
     }
@@ -908,9 +1266,79 @@ Type *OmpTgtAddrTrans::addAddrSpace(Type *T) {
   return T;
 }
 
+static bool isSimpleLoad(LoadInst *LI) {
+  // TODO align
+  if (LI->isSimple() && LI->isUnordered()
+      && LI->getPointerAddressSpace() == 0) {
+    return true;
+  } else {
+    LI->print(errs());
+    errs() << "LoadInst is not simple, ignore replacing\n";
+    return false;
+  }
+  return true;
+}
+
+Function *OmpTgtAddrTrans::genFakeLoadFunc(LoadInst *LI) {
+  if (!isSimpleLoad(LI)) {
+    LI->print(errs());
+    errs() << "Not a simple load inst, ignore\n";
+    return NULL;
+  }
+  // TODO add cachae
+  static map<PointerType*, Function *> Cache;
+  Type *OperandTy = LI->getPointerOperand()->getType();
+  if (!isa<PointerType>(OperandTy)) {
+    //errs() << "Don't use fake load on load of non-pointer\n";
+    //LI->print(errs());
+    return NULL;
+  }
+  PointerType *PT = dyn_cast<PointerType>(OperandTy);
+  Type *PointeeTy = PT->getElementType();
+  if (!isa<PointerType>(PointeeTy))  {
+    //errs() << "Don't use fake load on load of pointer to non-pointer\n";
+    //LI->print(errs());
+    return NULL;
+  }
+  auto search = Cache.find(PT);
+  if (search != Cache.end()) {
+    return search->second;
+  }
+  vector<Type*> ParamTypes;
+  ParamTypes.push_back(PT);
+  FunctionType *FakeLoadFuncTy = FunctionType::get(PointeeTy, ParamTypes, false);
+  hash_code NameHash((size_t)(uintptr_t)PT);
+  string FuncName = "__fload" + to_string(NameHash);
+  Function *FakeLoadFunc = Function::Create(FakeLoadFuncTy,
+      GlobalValue::ExternalLinkage, FuncName, module);
+  //FakeLoadFunc->addFnAttr(Attribute::ReadOnly);
+  FakeLoadFunc->addFnAttr(Attribute::NoUnwind);
+  FakeLoadFunc->addFnAttr(Attribute::ReadNone);
+
+  // Give fn attr
+  FakeLoadFunc->addFnAttr("omp-at-fload");
+
+  Cache[PT] = FakeLoadFunc;
+  return FakeLoadFunc;
+}
+
+Function *OmpTgtAddrTrans::replaceLoad(LoadInst *LI) {
+  Function *f = genFakeLoadFunc(LI);
+  if (!f) {
+    return f;
+  }
+  // gen CallInst
+  vector<Value*> Args;
+  Args.push_back(LI->getPointerOperand());
+  CallInst *CI = CallInst::Create(f->getFunctionType(), f, Args, Twine::createNull(), LI);
+  LI->replaceAllUsesWith(CI);
+  LI->dropAllReferences();
+  LI->eraseFromParent();
+  return f;
+}
+
 int16_t OmpTgtAddrTrans::doSharedMemOpt() {
-  // TODO
-  // check if we should apply it
+  // TODO evaluate effect
 
   // Create shared array
   // @_ZZ13staticReversePiiE1s =
@@ -931,69 +1359,72 @@ int16_t OmpTgtAddrTrans::doSharedMemOpt() {
     return FAILED;
   }
 
-  Function *BarFunc = module->getFunction("llvm.nvvm.barrier0");
-  if (!TidFunc) {
-    dp() <<  "llvm.nvvm.barrier0 is not found\n";
-    return FAILED;
-  }
-
   // Run from each entry
   for (auto E : FunctionTransEntry) {
-    Function *F = E.second;
+    Function *F = E.second[OMP_AT_TABLE];
+    Instruction *FirstInst = &*F->begin()->begin();
     // NO -> Find first use of table
     // insert AddrSpaceCast as first
-    Instruction *FirstInst = &*F->begin()->begin();
+
+    /*
     CastInst *SM2GenericAddr = CastInst::Create(Instruction::AddrSpaceCast,
         SharedMem, ATTablePtrType, "SM2GenericAddr", FirstInst);
-    // Get tid reg
-    CallInst *Tid = CallInst::Create(TidFunc->getFunctionType(), TidFunc,
-        "tid", FirstInst);
+        */
     // insert callinst
     //struct ATTableTy *(struct ATTableTy*, struct ATTableTy *sm, int16, int32)
     vector<Value*> StoreTableCallArgs;
-    StoreTableCallArgs.push_back(getFuncTableArg(F));
-    StoreTableCallArgs.push_back(SM2GenericAddr);
-    StoreTableCallArgs.push_back(ConstantInt::get(IT8, MaxATTableSize, false));
-    StoreTableCallArgs.push_back(Tid);
-    CallInst *NewTableAddr = CallInst::Create(StoreTableFunc->getFunctionType(),
-       StoreTableFunc, StoreTableCallArgs, "NewTableAddr", FirstInst);
+    Value *ATArg = getATArg(F);
+    StoreTableCallArgs.push_back(ATArg);
+
+    //auto *DummyInst = new AllocaInst(ATArg->getType(), 0, "dummy", &F->front());
+    auto *DummyInst = new BitCastInst(ATArg, ATArg->getType(), "dummy", &F->front());
+    ATArg->replaceAllUsesWith(DummyInst);
+
+    CallInst *NewTableAddr = CallInst::Create(
+        StoreTableFunc->getFunctionType(), StoreTableFunc,
+        StoreTableCallArgs, "NewTableAddr", FirstInst);
+
     // replace use
-    vector<Use*> UseToReplace;
-    for (auto &U : getFuncTableArg(F)->uses()) {
-      // Except the NewTableAddr call
-      if (U.getUser() == dyn_cast<User>(NewTableAddr)) {
-        continue;
-      }
-      UseToReplace.push_back(&U);
-    }
-    for (auto U : UseToReplace) {
-      U->set(NewTableAddr);
-    }
-    // barrier
-    CallInst::Create(BarFunc->getFunctionType(), BarFunc,
-        "", FirstInst);
+    DummyInst->replaceAllUsesWith(NewTableAddr);
+    DummyInst->dropAllReferences();
+    DummyInst->eraseFromParent();
+  }
+  // MaskVer
+  for (auto E : FunctionTransEntry) {
+    Function *F = E.second[OMP_AT_MASK];
+    Instruction *FirstInst = &*F->begin()->begin();
+    vector<Value*> StoreMaskFuncArgs;
+    Value *ATArg = getATArg(F);
+    StoreMaskFuncArgs.push_back(ATArg);
+
+    CallInst *Call = CallInst::Create(
+        StoreMaskFunc->getFunctionType(), StoreMaskFunc,
+
+    //auto *DummyInst = new AllocaInst(ATArg->getType(), 0, "dummy", &F->front());
+    auto *DummyInst = new BitCastInst(ATArg, ATArg->getType(), "dummy", &F->front());
+    ATArg->replaceAllUsesWith(DummyInst);
+        StoreMaskFuncArgs, Twine(), FirstInst);
   }
   return SUCCESS;
 }
 
-Argument *OmpTgtAddrTrans::getFuncTableArg(Function *F) {
+Argument *OmpTgtAddrTrans::getATArg(Function *F) {
   // Check name
-  assert(F->getName().endswith("_AT"));
+  assert(isATFunction(F));
   Argument *ATTableArg = F->arg_end() - 1;
-  // Check type
-  assert(ATTablePtrType == ATTableArg->getType());
   return ATTableArg;
 }
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
-  dp() << "Entering OmpTgtAddrTransPass\n";
+  dp() << "Entering OmpTgtAddrTrans\n";
   IsDebug = (bool) getenv("DP2");
-  IsNaiveAT = (bool) getenv("OMP_NAIVE_AT");
+//  IsNaiveAT = (bool) getenv("OMP_NAIVE_AT");
   EnableAS = (bool) getenv("LLVM_AS");
+  DisableFakeLoad = (bool) getenv("OMP_NOFL");
   bool changed = false;
 
   if (init(M)) {
-    dp() << "[OmpTgtAddrTransPass] Failed to init, exit\n";
+    dp() << "[OmpTgtAddrTrans] Failed to init, exit\n";
     return changed;
   }
 
@@ -1015,8 +1446,8 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   // Add Functions to metadata
   addEntryFunctionsAsKernel(FunctionTransEntry);
 
+  /*
   if (EnableAS) {
-    /*
     //FunctionPass *IASP = createInferAddressSpacesPass();
     for (auto E : FunctionTransEntry) {
     //  TODO
@@ -1024,31 +1455,29 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
       //dp() << printFunction(F);
     }
     return changed;
-    */
   }
+*/
 
   for (auto &E : FunctionTransEntry) {
-    Function *F = E.second;
-    size_t EntryArgSize = F->arg_size() - 1;
-    auto ArgItr = F->arg_begin();
-    // All pointer args of entry function is CPU address
-    for (size_t i = 0; i < EntryArgSize; i++, ArgItr++) {
-      if (isArgNeedAT(ArgItr)) {
-        // For naive translation
-        if (IsNaiveAT) {
-          naiveAT(F);
-          break;
+    ATFunctionSet &FS = E.second;
+    for (auto &Ver : FS) {
+      Function *F = Ver.second;
+      CurATMode = Ver.first;
+      size_t EntryArgSize = F->arg_size();
+      auto ArgItr = F->arg_begin();
+      // All pointer args of entry function is CPU address
+      for (size_t i = 0; i < EntryArgSize; i++, ArgItr++) {
+        if (isArgNeedAT(ArgItr)) {
+          traceArgInFunc(F, ArgItr, Ver.first);
         }
-        // For performance translation
-        traceArgInFunc(F, ArgItr);
-
       }
     }
   }
+  epilogue();
 
   doSharedMemOpt();
   dp() << "Inserted " << InsertedATCount << " address tranlation\n";
-  dp() << "OmpTgtAddrTransPass Finished\n";
+  dp() << "OmpTgtAddrTrans Finished\n";
 
   return changed;
 }
@@ -1084,25 +1513,114 @@ public:
 };
 }
 
+bool RestoreLoad::runOnModule(Module &M) {
+  int Count = 0;
+  for (auto &F : M) {
+    if (!isATFunction(&F)) {
+      continue;
+    }
+    for (auto &BB : F) {
+      vector<Instruction *> InstsCopy;
+      for (auto &I : BB) {
+        InstsCopy.push_back(&I);
+      }
+      for (auto I : InstsCopy) {
+        if (CallInst *CI = dyn_cast<CallInst>(I)) {
+          bool ret = restoreLoad(CI);
+          if (ret) {
+            Count++;
+          }
+        }
+      }
+    }
+  }
+  errs() << "RestoreLoad restored " << Count << " LoadInst\n";
 
+  return Count > 0;
+}
 
+bool ConcurrentAT::init(Module &M) {
+  HasError = false;
+  NvvmTidIID = Function::lookupIntrinsicID("llvm.nvvm.read.ptx.sreg.tid.x");
+  if (NvvmTidIID == Intrinsic::not_intrinsic) {
+    errs() << "nvvm tid intrinsic not found";
+    HasError = true;
+  }
+  NvvmCtaidIID = Function::lookupIntrinsicID("llvm.nvvm.read.ptx.sreg.ctaid.x");
+  if (NvvmCtaidIID == Intrinsic::not_intrinsic) {
+    errs() << "nvvm ttaid intrinsic not found";
+    HasError = true;
+  }
+  return true;
+}
+bool ConcurrentAT::runOnModule(Module &M) {
+  init(M);
+  if (HasError) {
+    return false;
+  }
+  int Count = 0;
+  for (auto &F : M) {
+    if (!isATFunction(&F)) {
+      continue;
+    }
+    Count += doConcurrentAT(&F);
+  }
+  errs() << "Merged " << Count << " ATCalls\n";
+  return Count > 0;
+}
+
+bool RestoreLoad::restoreLoad(CallInst *CI) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee) {
+    return false;
+  }
+  if (!Callee->hasFnAttribute("omp-at-fload")) {
+    return false;
+  }
+  LoadInst *LI = new LoadInst(CI->getType(), CI->getArgOperand(0), "restoredLI",CI);
+  CI->replaceAllUsesWith(LI);
+  CI->dropAllReferences();
+  CI->eraseFromParent();
+  return true;
+}
+
+char RestoreLoad::ID = 0;
 char OmpTgtAddrTrans::ID = 0;
+char ConcurrentAT::ID = 0;
+
+static string Description = "OpenMP Offloading with Address Translation";
+static string PassBreifName = "ompat";
+static string Description2 = "Restore Fake Load CallInst";
+static string PassBreifName2 = "reflo";
+static string Description3 = "Merger AT calls to concurrent";
+static string PassBreifName3 = "ompcat";
 
 #ifdef LLVM_MODULE
-static RegisterPass<OmpTgtAddrTrans>
-Y("OmpTgtAddrTrans", "OmpTgtAddrTransPass Description");
+static RegisterPass<OmpTgtAddrTrans> Y(PassBreifName, Description);
+
+static RegisterPass<RestoreLoad> X(PassBreifName2, Description2);
+
+//static RegisterPass<ConcurrentAT> Z(PassBreifName3, Description3);
 
 #else
-INITIALIZE_PASS(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
-
+INITIALIZE_PASS(OmpTgtAddrTrans, PassBreifName, Description, false, false)
+INITIALIZE_PASS(RestoreLoad, PassBreifName2, Description2, false, false)
+//INITIALIZE_PASS(ConcurrentAT, PassBreifName2, Description2, false, false)
 ModulePass *llvm::createOmpTgtAddrTransPass() {
   return new OmpTgtAddrTrans();
 }
+ModulePass *llvm::createRestoreLoadPass() {
+  return new RestoreLoad();
+}
+/*
+ModulePass *llvm::createConcurrentATPass() {
+  return new ConcurrentAT();
+}
+*/
 #endif
 
-// TODO
-//INITIALIZE_PASS_BEGIN(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
+//  Add pass dependency
+//INITIALIZE_PASS_BEGIN(OmpTgtAddrTrans, "OmpTgtAddrTrans", "Description TODO", false, false)
 //INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
 //INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-//INITIALIZE_PASS_END(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Description TODO", false, false)
-//INITIALIZE_PASS_END(OmpTgtAddrTrans, "OmpTgtAddrTransPass", "Scalar Replacement Of Aggregates", false, false)
+//INITIALIZE_PASS_END(OmpTgtAddrTrans, "OmpTgtAddrTrans", "Description TODO", false, false)

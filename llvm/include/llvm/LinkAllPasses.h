@@ -226,6 +226,7 @@ namespace {
       (void) llvm::createHardwareLoopsPass();
 
       (void) llvm::createOmpTgtAddrTransPass();
+      (void) llvm::createRestoreLoadPass();
 
       (void)new llvm::IntervalPartition();
       (void)new llvm::ScalarEvolutionWrapperPass();

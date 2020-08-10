@@ -4188,7 +4188,7 @@ InputInfo Driver::BuildJobsForActionNoCache(
   if (isOmpNvptx) {
     // Put prebuilt obj path into InputInfos
     // If we can get llvm src dir??
-    std::string PreBuiltPath("/home/pschen/llvm/thesis/llvm-project/llvm");
+    std::string PreBuiltPath("/home/pschen/src-pschen/src/llvm-project/llvm");
     PreBuiltPath.append("/lib/Transforms/OmpTgtAddrTrans/obj");
     ObjName = PreBuiltPath + "/AT.o";
     SrcName = PreBuiltPath + "/AT.c";

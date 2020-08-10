@@ -2,7 +2,9 @@
 # from the hello plugin.
 if( NOT LLVM_REQUIRES_RTTI )
   if( NOT LLVM_REQUIRES_EH )
-      set(LLVM_EXPORTED_SYMBOL_FILE ${CMAKE_CURRENT_SOURCE_DIR}/OmpTgtAddrTrans.exports)
+      set(LLVM_EXPORTED_SYMBOL_FILE
+          ${CMAKE_CURRENT_SOURCE_DIR}/OmpTgtAddrTrans.exports
+          )
   endif()
 endif()
 
@@ -12,8 +14,9 @@ endif()
 
 add_definitions(-DLLVM_MODULE)
 
-add_llvm_library( LLVMOmpTgtAddrTrans MODULE BUILDTREE_ONLY
+add_llvm_library(LLVMOmpTgtAddrTrans MODULE BUILDTREE_ONLY
   OmpTgtAddrTrans.cpp
+  Testing.cpp
 
   DEPENDS
   intrinsics_gen

@@ -4,4 +4,4 @@
 
 # Commnad
 
-$ opt -S -load $LLVM_BUILD_PATH/lib/LLVMOmpTgtAddrTrans.so -OmpTgtAddrTrans > out.ll < 2D.cPreOmpATPass.ll                                                         (pschen✗)
+opt -S -load $LLVM_BUILD_PATH/lib/LLVMOmpTgtAddrTrans.so -ompat -o out.ll < 2D.cPreOmpATPass.ll

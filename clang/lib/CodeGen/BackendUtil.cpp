@@ -312,9 +312,58 @@ static void addKernelMemorySanitizerPass(const PassManagerBuilder &Builder,
   addGeneralOptsForMemorySanitizer(Builder, PM, /*CompileKernel*/ true);
 }
 
+static std::string srcName;
+
 static void addThreadSanitizerPass(const PassManagerBuilder &Builder,
                                    legacy::PassManagerBase &PM) {
   PM.add(createThreadSanitizerLegacyPassPass());
+}
+
+static void addOmpTgtTransPass(const PassManagerBuilder &Builder,
+                                   legacy::PassManagerBase &PM) {
+  PM.add(createOmpTgtAddrTransPass());
+  PM.add(createEarlyCSEPass());
+}
+
+static void addRestoreLoadPass(const PassManagerBuilder &Builder,
+                                   legacy::PassManagerBase &PM) {
+  PM.add(createRestoreLoadPass());
+}
+
+template<int n> static void addIRPrintingPass(const PassManagerBuilder &Builder,
+                                   legacy::PassManagerBase &PM) {
+  std::error_code ec;
+  std::string Dir("/tmp/");
+  std::string PositfixTable[] = {
+    "",
+    "PreATPass.ll",
+    "PostATPass.ll",
+    "PreFinalATPass.ll",
+    "PostFinalATPass.ll"
+  };
+  std::string IRFile  = Dir + srcName + PositfixTable[n];
+  static raw_fd_ostream OS(IRFile, ec, sys::fs::OF_None);
+
+  if (ec) {
+    errs() << "Create raw_fd_ostream of " << IRFile << " failed\n";
+    errs() << ec.message() << "\n";
+    return ;
+  }
+  //EarlyCSEPass ??
+  PM.add(createVerifierPass());
+  PM.add(createPrintModulePass(OS, "", false));
+}
+
+static void addMyPassesLast(PassManagerBuilderWrapper &PMBuilder) {
+  // Put them to the last
+  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                       addIRPrintingPass<3>);
+  //PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+  //                     addOmpTgtTransPass);
+  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                       addRestoreLoadPass);
+  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                       addIRPrintingPass<4>);
 }
 
 static void addDataFlowSanitizerPass(const PassManagerBuilder &Builder,
@@ -718,41 +767,35 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
   if (!CodeGenOpts.SampleProfileFile.empty())
     PMBuilder.PGOSampleUse = CodeGenOpts.SampleProfileFile;
 
-  if (TargetTriple.isNVPTX()) {
-    bool DumpIR = true;
-    std::error_code ec1, ec2;
-    std::string Prefix("/tmp/");
-    Prefix += llvm::sys::path::filename(TheModule->getSourceFileName());
-    std::string PreIRFile = Prefix + "PreOmpATPass.ll";
-    std::string PostIRFile = Prefix + "PostOmpATPass.ll";
-    static raw_fd_ostream RFO1(PreIRFile, ec1, sys::fs::OF_None);
-    static raw_fd_ostream RFO2(PostIRFile, ec2, sys::fs::OF_None);
-
-    if (ec1 || ec2) {
-      if (ec1) {
-        errs() << "Create raw_fd_ostream of " << PreIRFile << " failed\n";
-        errs() << ec1.message() << "\n";
-      }
-      if (ec2) {
-        errs() << "Create raw_fd_ostream of " << PostIRFile << " failed\n";
-        errs() << ec2.message() << "\n";
-      }
-      DumpIR = false;
-    }
-    // Print IR before Pass
-    if (DumpIR) {
-      MPM.add(createVerifierPass());
-      MPM.add(createPrintModulePass(RFO1, "", false));
-    }
-
-    MPM.add(createOmpTgtAddrTransPass());
-
-    // Print IR after Pass
-    if (DumpIR) {
-      MPM.add(createVerifierPass());
-      MPM.add(createPrintModulePass(RFO2, "", false));
-    }
+  if (getenv("OMP_NO_AT")) {
+    goto end;
   }
+  if (TargetTriple.isNVPTX() && (CodeGenOpts.getDebugInfo() == codegenoptions::NoDebugInfo)) {
+    // Try to insert before loop opt
+    srcName = llvm::sys::path::filename(TheModule->getSourceFileName());
+
+    // If O0 point is EP_EnabledOnOptLevel0
+    PassManagerBuilder::ExtensionPointTy Point;
+
+    if (CodeGenOpts.OptimizationLevel == 0) {
+      Point = PassManagerBuilder::EP_EnabledOnOptLevel0;
+      PMBuilder.addExtension(Point, addIRPrintingPass<1>);
+      PMBuilder.addExtension(Point, addOmpTgtTransPass);
+      PMBuilder.addExtension(Point, addRestoreLoadPass);
+      PMBuilder.addExtension(Point, addIRPrintingPass<2>);
+    } else {
+      Point = PassManagerBuilder::EP_ModuleOptimizerEarly;
+      PMBuilder.addExtension(Point, addIRPrintingPass<1>);
+      PMBuilder.addExtension(Point, addOmpTgtTransPass);
+      PMBuilder.addExtension(Point, addIRPrintingPass<2>);
+    }
+    // Candidates
+    // PassManagerBuilder::EP_EarlyAsPossible;
+    // PassManagerBuilder::EP_ModuleOptimizerEarly
+    // ;
+    addMyPassesLast(PMBuilder);
+  }
+end:
 
   PMBuilder.populateFunctionPassManager(FPM);
   PMBuilder.populateModulePassManager(MPM);

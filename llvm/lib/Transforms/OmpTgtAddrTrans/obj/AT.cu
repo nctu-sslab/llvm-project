@@ -10,54 +10,96 @@ extern "C" { // disable name mangling
 
 // Translate function
 // Binary search version
-__device__ void *AddrTrans(void* addr, struct ATTableTy* table) {
-    int size = table[0].HstPtrBegin;
+#define SM_TABLE_SIZE 20
+__shared__ struct ATTableTy sm_table[SM_TABLE_SIZE];
+__shared__ uintptr_t sm_mask;
+__device__ static struct ATTableTy *tableptr;
+
+__device__ static int flag = 0;
+
+__device__ void *AddrTransTable(void* addr) {
+//    printf("AddrTransing bypassing: %p\n",addr);
+    //return addr;
+    int size = tableptr[0].HstPtrBegin;
     uintptr_t ret = 0;
     uintptr_t addr_int = (intptr_t) addr;
-    int head = 1, end = size + 1;
-    while (head < end) {
-        int mid = (head + end) >> 1;
-        if (addr_int >= table[mid].HstPtrBegin) {
-            if (addr_int < table[mid].HstPtrEnd) {
-                ret = addr_int - table[mid].HstPtrBegin + table[mid].TgtPtrBegin;
+    int head = 1, end = size;
+    int mid;
+    while (head <= end) {
+        mid = (head + end) >> 1;
+            // TODO don't check end to increase perf
+        if (addr_int >= tableptr[mid].HstPtrBegin) {
+            if (addr_int < tableptr[mid].HstPtrEnd) {
+                ret = addr_int - tableptr[mid].HstPtrBegin + tableptr[mid].TgtPtrBegin;
                 break;
+            } else {
+                end = mid -1;
             }
-            head = mid+1;
         } else {
-            end = mid;
-        }
-    }
-    // Don't fault when notfound
-    if (ret == 0) {
-        for (int i = 1; i <= size; i++) {
-            if (addr_int >= table[i].HstPtrBegin && addr_int < table[i].HstPtrEnd) {
-                ret = addr_int - table[i].HstPtrBegin + table[i].TgtPtrBegin;
-                break;
-            }
+            head = mid+1;
         }
     }
     if (ret == 0) {
+        printf("fall back addrtrans: %p mid=%d end=%d, size:%d\n",addr, mid, end,size);
         return addr;
     }
     return (void*)ret;
 }
 
-// Only id 0 do this
-__device__ struct ATTableTy *StoreTableShared(struct ATTableTy* table, struct ATTableTy *sm,
-        int8_t size /* max size of table in sm */, int32_t tid) {
-    int table_size = table[0].HstPtrBegin + 1;
+// Only id 0 of the block does this
+__device__ struct ATTableTy *StoreTableShared(struct ATTableTy* table) {
+    // FIXME;
+    //printf("StoreTableShared\n");
+    //return table;
+    int32_t id = threadIdx.x; // warning missing blockdim
+    size_t table_size;
+    if (id != 0) {
+        goto end;
+    }
+    // FIXME
+        tableptr = table;
+        goto end;
+    table_size = table[0].HstPtrBegin + 1;
     // if oversize
-    if (table_size > size) {
-        return table;
+    if (table_size > SM_TABLE_SIZE) {
+        tableptr = table;
+        goto end;
     }
-    if (tid != 0) {
-        return sm;
-    }
-    // memcpy
+    // memcpy TODO cuda has memcpy
+    tableptr = sm_table;
     for (int i = 0; i < table_size; i++) {
-        sm[i] = table[i];
+        tableptr[i] = table[i];
     }
-    return sm;
+end:
+    // sync to wait at return
+    __syncthreads();
+    return tableptr;
 }
-// sync to wait at return
+
+__device__ void *AddrTransMask(void *addr) {
+
+    //int32_t id = threadIdx.x; // warning missing blockdim
+    //printf("%d: %p->%p\n",id, addr,(void*)((uintptr_t)addr | sm_mask));
+    return (void*)((uintptr_t)addr | sm_mask);
+}
+
+__device__ void StoreMaskShared(uintptr_t mask) {
+    int id = threadIdx.x;
+    if (id != 0) {
+        goto end;
+    }
+    //printf("%p\n", (void*)mask);
+    sm_mask = mask;
+end:
+    __syncthreads();
+}
+
+// TODO QQ God bless
+__device__ void ConcurrentTrans(int count) {
+    int32_t id = threadIdx.x; // warning missing blockdim
+    //sm[idx] = AddrTrans(sm[idx]);
+    /*
+    for (start: end) {
+    }*/
+}
 }

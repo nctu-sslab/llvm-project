@@ -193,6 +193,7 @@ LookupResult DeviceTy::lookupMapping(void *HstPtrBegin, int64_t Size) {
 void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
     int64_t Size, bool &IsNew, bool IsImplicit, bool UpdateRefCount) {
   void *rc = NULL;
+  mm_context_t *context = NULL;
   DataMapMtx.lock();
   LookupResult lr = lookupMapping(HstPtrBegin, Size);
 
@@ -228,19 +229,13 @@ void *DeviceTy::getOrAllocTgtPtr(void *HstPtrBegin, void *HstPtrBase,
         tp = 0;
       }
     } else {
-      if (IsMaskEnabled && _MYMALLOC_ISMYSPACE(HstPtrBegin)) {
-        tp = (uintptr_t)_MYMALLOC_H2D(HstPtrBegin);
-        DP2("Skip alloc mem already in myspace: %p->%p\n", HstPtrBegin, (void*)tp);
-      } else {
-        tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
-      }
+      tp = (uintptr_t)RTL->data_alloc(RTLDeviceID, Size, HstPtrBegin);
     }
     DP("Creating new map entry: HstBase=" DPxMOD ", HstBegin=" DPxMOD ", "
         "HstEnd=" DPxMOD ", TgtBegin=" DPxMOD "\n", DPxPTR(HstPtrBase),
         DPxPTR(HstPtrBegin), DPxPTR((uintptr_t)HstPtrBegin + Size), DPxPTR(tp));
-
-    HostDataToTargetMap.emplace((uintptr_t)HstPtrBase,
-        (uintptr_t)HstPtrBegin, (uintptr_t)HstPtrBegin + Size, tp);
+    HostDataToTargetMap.emplace((uintptr_t)HstPtrBase, (uintptr_t)HstPtrBegin,
+        (uintptr_t)HstPtrBegin + Size, tp);
     rc = (void *)tp;
   }
   DataMapMtx.unlock();
@@ -454,7 +449,7 @@ int32_t DeviceTy::update_suspend_list() {
     TgtPtrValueBegin = bulkGetTgtPtrBegin(upt.PtrValue,sizeof(void*));
     TgtPtrValue = (void*)((uintptr_t)TgtPtrValueBegin - upt.Delta);
 //#ifndef HOST_SHADOW_PTR
-    if (OptNoHostShadow) {
+    if (!OptHostShadow) {
       DP2("Update target pointer:" DPxMOD " to val:" DPxMOD "\n", DPxPTR(TgtPtrBaseAddr), DPxPTR(TgtPtrValue));
       ret = data_submit(TgtPtrBaseAddr,  &TgtPtrValue, sizeof(void*));
       if (ret) {
@@ -473,7 +468,7 @@ int32_t DeviceTy::update_suspend_list() {
         return -1;
       }
       // alloc a space for host shadow pointer array if there is not
-      if (!entry->HostShadowPtrSpace) {
+      if (OptHostShadow && !entry->HostShadowPtrSpace) {
         size_t size = entry->HstPtrEnd - entry->HstPtrBegin;
         void *NewSpace = malloc(size);
         entry->HostShadowPtrSpace = (void**)NewSpace;
@@ -497,7 +492,7 @@ int32_t DeviceTy::update_suspend_list() {
     PERF_WRAP(Perf.UpdatePtr.end();)
   }
 
-  if (!OptNoHostShadow) {
+  if (OptHostShadow) {
     // Transfer pointer bulks
     while (!HostShadows.empty()) {
       auto entry = HostShadows.front();

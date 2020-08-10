@@ -30,7 +30,7 @@ int DebugLevel = 0;
 int DebugLevel2 = 0;
 #endif // OMPTARGET_DEBUG
 
-int OptNoHostShadow = 0;
+int OptHostShadow = 0;
 
 /* All begin addresses for partially mapped structs must be 8-aligned in order
  * to ensure proper alignment of members. E.g.
@@ -353,6 +353,23 @@ DCGEN_REPEAT:
           DP("Copying data to device failed.\n");
           return OFFLOAD_FAIL;
         }
+        if (Device.IsMaskEnabled && data_size == sizeof(void*)) {
+          // FIXME what if this is not a address???
+          // TODO Add flag
+          void *ptr = *(void**)HstPtrBegin;
+          if (_MYMALLOC_ISMYSPACE(ptr)) {
+            mm_context_t *context = get_mm_context(ptr);
+            if (context) {
+              DP2("Transfer " DPxMOD " with  dc object #%d\n",
+                  DPxPTR(HstPtrBegin), context->id);
+              rt = context->data_submit();
+              if (rt != OFFLOAD_SUCCESS) {
+                return OFFLOAD_FAIL;
+              }
+            }
+          }
+          // check address
+        }
       }
     }
 
@@ -669,6 +686,19 @@ DCGEN_REPEAT:
             DP("Copying data from device failed.\n");
             return OFFLOAD_FAIL;
           }
+          if (Device.IsMaskEnabled && data_size == sizeof(void*)) {
+            // FIXME what if this is not a address???
+            // TODO Add flag
+            void *ptr = *(void**)HstPtrBegin;
+            if (_MYMALLOC_ISMYSPACE(ptr)) {
+              mm_context_t *context = get_mm_context(ptr);
+              if (context) {
+                DP2("Transfer back" DPxMOD " with  dc object #%d\n",
+                    DPxPTR(HstPtrBegin), context->id);
+                context->data_retrieve();
+              }
+            }
+          }
         }
       }
 
@@ -982,7 +1012,6 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     void *TgtPtrBegin;
     ptrdiff_t TgtBaseOffset;
     bool IsLast; // unused.
-    DP2("Target before launch\n");
     if (arg_types[i] & OMP_TGT_MAPTYPE_LITERAL) {
       DP("Forwarding first-private value " DPxMOD " to the target construct\n",
           DPxPTR(HstPtrBase));
@@ -1038,6 +1067,7 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
       if (Device.IsMaskEnabled && _MYMALLOC_ISMYSPACE(HstPtrBegin)) {
+        TgtPtrBegin = (void*)_MYMALLOC_H2D(HstPtrBegin);
         DP2("omp target launching with myspace arg: %p->%p\n",
             HstPtrBegin, TgtPtrBegin);
       }

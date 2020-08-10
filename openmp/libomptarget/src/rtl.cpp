@@ -48,8 +48,8 @@ void RTLsTy::LoadRTLs() {
   }
 #endif // OMPTARGET_DEBUG
 
-  if (char *envStr = getenv("OMP_NO_HOSTSHADOW")) {
-    OptNoHostShadow = std::stoi(envStr);
+  if (char *envStr = getenv("OMP_HOSTSHADOW")) {
+    OptHostShadow = 1;
   }
 
   // Parse environment variable OMP_TARGET_OFFLOAD (if set)

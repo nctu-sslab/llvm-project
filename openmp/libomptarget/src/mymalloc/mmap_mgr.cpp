@@ -26,7 +26,7 @@ static int insert_new_region(void *begin, size_t size, mmap_region *pos) {
   size_t region_size = align_end - align_begin;
 
   void *ret = mmap((void *)align_begin, region_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+                   MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (ret == (void *)-1) {
     // failed
     // perror("");

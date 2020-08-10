@@ -31,5 +31,16 @@ extern void mymalloc_begin(int64_t deviceID);
 extern void mymalloc_end();
 
 // mmcontext for submit and retrieve
+typedef struct mm_context {
+  unsigned int id;
+  int64_t device_id;
+  struct heap *heap_list;
+  struct RTLInfoTy *RTL;
+  int32_t data_submit();
+  int32_t data_retrieve();
+  // TODO buddy system is needed
+} mm_context_t;
+
+extern mm_context_t *get_mm_context(void *p);
 
 #endif // __MYMALLOC_H__

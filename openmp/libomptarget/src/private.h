@@ -74,7 +74,7 @@ int __kmpc_get_target_offload(void) __attribute__((weak));
 }
 #endif
 
-extern int OptNoHostShadow;
+extern int OptHostShadow;
 
 #ifdef OMPTARGET_DEBUG
 extern int DebugLevel;

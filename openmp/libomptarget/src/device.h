@@ -22,6 +22,7 @@
 #include <set>
 #include <queue>
 
+#include "mymalloc.h"
 
 // Forward declarations.
 struct RTLInfoTy;
@@ -39,18 +40,21 @@ struct HostDataToTargetTy {
 
   mutable uintptr_t TgtPtrBegin; // target info.
 
-  mutable void** HostShadowPtrSpace;
-
   mutable long RefCount;
+  // Additional ptr
+  union {
+    mutable void **HostShadowPtrSpace;
+    mutable void *ptr;
+  };
   HostDataToTargetTy()
-      : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0), HostShadowPtrSpace(NULL),
+      : HstPtrBase(0), HstPtrBegin(0), HstPtrEnd(0), ptr(NULL),
         TgtPtrBegin(0), RefCount(0) {}
   HostDataToTargetTy(uintptr_t BP, uintptr_t B, uintptr_t E, uintptr_t TB)
-      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), HostShadowPtrSpace(NULL),
+      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), ptr(NULL),
         TgtPtrBegin(TB), RefCount(1) {}
   HostDataToTargetTy(uintptr_t BP, uintptr_t B, uintptr_t E, uintptr_t TB,
       long RF)
-      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), HostShadowPtrSpace(NULL),
+      : HstPtrBase(BP), HstPtrBegin(B), HstPtrEnd(E), ptr(NULL),
         TgtPtrBegin(TB), RefCount(RF) {}
 };
 

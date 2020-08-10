@@ -13,6 +13,7 @@
 #include "mymalloc.h"
 #include "private.h"
 #include "rtl.h"
+#include "perf.h"
 
 // reference https://moss.cs.iit.edu/cs351/slides/slides-malloc.pdf
 // TODO implement free
@@ -44,16 +45,6 @@ typedef struct heap {
   struct heap *pre;
 } heap_t;
 
-typedef struct mm_context {
-  unsigned int id;
-  // DeviceTy *device;
-  int64_t device_id;
-  heap_t *heap_list;
-  struct RTLInfoTy *RTL;
-  int32_t data_submit();
-  // TODO buddy system is needed
-} mm_context_t;
-
 static size_t pg_size;
 static char pg_shift = 0;
 static uintptr_t pg_mask = 0;
@@ -63,6 +54,8 @@ heap_t *curr_heap = &default_heap;
 mm_context_t *curr_context;
 uint16_t context_count = 0;
 static char inited = 0;
+
+static mm_context_t contexts[10];
 
 static void *myrealloc(void *ptr, size_t size);
 static void *mymalloc(size_t size);
@@ -121,8 +114,6 @@ void *realloc(void *ptr, size_t size) {
       memcpy(ret, ptr, copy_size);
       myfree(ptr);
       return ret;
-      // copy data from my space
-      // FIXME
     } else {
       return myrealloc(ptr, size);
     }
@@ -208,7 +199,6 @@ __attribute__((constructor)) static void init() {
 // pre and next are uninited
 // Allocate new heap and init first block
 static heap_t *new_heap(int page_count) {
-  printf("new_heap\n");
   if (page_count == 0) {
     page_count = DEFAULT_BLOCK_SZ;
   }
@@ -223,10 +213,8 @@ static heap_t *new_heap(int page_count) {
   // FIXME
   void *dptr =
       curr_context->RTL->data_alloc(curr_context->device_id, size, NULL);
-  // printf("\tReturn address %p 0x%zx from RTL->data_alloc\n",dptr, size);
 
   void *d2h_ptr = (void *)(_omp_d2hmask & (uintptr_t)dptr);
-  // printf("_omp_d2hmask: %p -> %p\n" ,(void*)_omp_d2hmask, d2h_ptr);
 
   // align to page size
   int mmap_ret = mmap_region_register(d2h_ptr, size);
@@ -243,7 +231,8 @@ static heap_t *new_heap(int page_count) {
   first_blk->size = (uintptr_t)ret->end - (uintptr_t)ret->begin;
   // size_t size = (uintptr_t)ret->end - (uintptr_t)ret->begin;
   if (page_count != DEFAULT_BLOCK_SZ) {
-    printf("larger heap: %p-%p 0x%zx\n", ret->begin, ret->end, first_blk->size);
+    DP2("Alloced larger heap: %p-%p 0x%zx\n",
+        ret->begin, ret->end, first_blk->size);
   }
   return ret;
 }
@@ -251,10 +240,7 @@ static heap_t *new_heap(int page_count) {
 static blk_hdr_t *find_next_fit(size_t size) {
   blk_hdr_t *curr_blk = (blk_hdr_t *)curr_heap->next_free;
   void *end = curr_heap->end;
-  // FIXME this is first fit
-  //
   while ((void *)curr_blk < end) {
-    // printf("blk %p size: 0x%zx\n", curr_blk, curr_blk->size);
     if (IS_FREE(curr_blk) && curr_blk->size >= size) {
       // try split here
       // NOTE check rest space for header
@@ -266,6 +252,7 @@ static blk_hdr_t *find_next_fit(size_t size) {
         curr_heap->next_free = rest;
       } else {
         curr_heap->next_free = curr_heap->begin;
+        exit(99);
         size = curr_blk->size;
       }
       curr_blk->size = size;
@@ -277,8 +264,10 @@ static blk_hdr_t *find_next_fit(size_t size) {
   // NOTICE if the size is too big allocate bigger heap
   heap_t *heap_new;
   if (size >= curr_heap->page_count * PAGE_SIZE) {
-    printf("new heap size: 0x%zx 0x%zx\n", PAGE_ALIGN(size * 8), size * 10);
-    heap_new = new_heap(PAGE_ALIGN(size * 8) / PAGE_SIZE);
+    //DP2("allocate too big 0x%zx: new_heap size from 0x%zx -> 0x%zx\n", size, curr_heap->page_count  PAGE_ALIGN(size * 8), size * 8);
+    // FIXME how to balance this value
+    // multi-level threshold to determine the multiplier
+    heap_new = new_heap(PAGE_ALIGN(size*2) >> pg_shift);
   } else {
     // NOTE heap size is incremental
     heap_new = new_heap(curr_heap->page_count);
@@ -303,7 +292,7 @@ void context_create(int64_t device_id) {
   uint16_t cid = context_count++;
   DeviceTy *Device = &Devices[device_id];
 
-  curr_context = (mm_context_t *)mallocp(sizeof(mm_context_t));
+  curr_context = &contexts[cid];
 
   // bind device with context
   // curr_context->device = Device;
@@ -317,6 +306,7 @@ void context_create(int64_t device_id) {
   heap_new->next = heap_new;
   curr_context->heap_list = heap_new;
   curr_heap = curr_context->heap_list;
+  DP2("Create new mm context #%d\n", curr_context->id);
 }
 
 static void *mymalloc(size_t size) {
@@ -402,4 +392,76 @@ static void *dlcalloc(size_t count, size_t size) {
 }*/
 
 int32_t mm_context_t::data_submit() {
+  static unsigned int count = 0;
+  heap_t *first = heap_list;
+  heap_t *curr = first;
+  do  {
+    count++;
+    PERF_WRAP(Perf.H2DTransfer.start();)
+    void *hbegin = curr->begin;
+    void *tbegin = (void*)_MYMALLOC_H2D(curr->begin);
+    // FIXME next_free is not always the end
+    int64_t size = (uintptr_t)curr->next_free - (uintptr_t)hbegin;
+    if (size==0) {
+      curr = curr->next;
+      PERF_WRAP(Perf.H2DTransfer.end();)
+      continue;
+    }
+    //size = curr->page_count*PAGE_SIZE;
+    int32_t ret = RTL->data_submit(device_id,
+        tbegin, hbegin, size);
+        //tbegin, hbegin, curr->page_count*PAGE_SIZE);
+    if (ret) {
+      DP2("mm_context_t data_submit failed\n");
+      return OFFLOAD_FAIL;
+    }
+    PERF_WRAP(Perf.H2DTransfer.end();)
+    curr = curr->next;
+  } while(curr != first);
+  DP2("data_submit accum count: %d\n", count);
+  return OFFLOAD_SUCCESS;
+  //return 0;
+}
+int32_t mm_context_t::data_retrieve() {
+  static unsigned int count = 0;
+  heap_t *first = heap_list;
+  heap_t *curr = first;
+  do  {
+    count++;
+    PERF_WRAP(Perf.D2HTransfer.start();)
+    void *hbegin = curr->begin;
+    void *tbegin = (void*)_MYMALLOC_H2D(curr->begin);
+    size_t size = (uintptr_t)curr->next_free - (uintptr_t)hbegin;
+    if (size==0) {
+      curr = curr->next;
+      continue;
+    }
+    int32_t ret = RTL->data_retrieve(device_id,
+        hbegin, tbegin, size);
+        //hbegin, tbegin, curr->page_count*PAGE_SIZE);
+    if (ret) {
+      return OFFLOAD_FAIL;
+    }
+    PERF_WRAP(Perf.D2HTransfer.end();)
+    curr = curr->next;
+  } while(curr != first);
+  DP2("data_retrieve accum count: %d\n", count);
+  return OFFLOAD_SUCCESS;
+}
+
+mm_context_t *get_mm_context(void *p) {
+  static unsigned int count = 0;
+  for (int i = 0; i < context_count; i++) {
+    heap_t *first = contexts[i].heap_list;
+    heap_t *curr = first;
+    do  {
+      count++;
+      if (p >= curr->begin && p < curr->end) {
+        DP2("get_mm_context accum search count: %d\n", count);
+        return &contexts[i];
+      }
+      curr = curr->next;
+    } while(curr != first);
+  }
+  return NULL;
 }

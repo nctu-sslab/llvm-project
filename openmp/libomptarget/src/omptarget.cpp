@@ -353,7 +353,7 @@ DCGEN_REPEAT:
           DP("Copying data to device failed.\n");
           return OFFLOAD_FAIL;
         }
-        if (Device.IsMaskEnabled && data_size == sizeof(void*)) {
+        if (Device.IsDCEnabled && data_size == sizeof(void*)) {
           // FIXME what if this is not a address???
           // TODO Add flag
           void *ptr = *(void**)HstPtrBegin;
@@ -361,7 +361,7 @@ DCGEN_REPEAT:
             mm_context_t *context = get_mm_context(ptr);
             if (context) {
               DP2("Transfer " DPxMOD " with  dc object #%d\n",
-                  DPxPTR(HstPtrBegin), context->id);
+                  DPxPTR(ptr), context->id);
               rt = context->data_submit();
               if (rt != OFFLOAD_SUCCESS) {
                 return OFFLOAD_FAIL;
@@ -373,9 +373,10 @@ DCGEN_REPEAT:
       }
     }
 
-    if (Device.IsMaskEnabled) {
+    /*
+    if (Device.IsDCEnabled) {
       goto skip_update;
-    }
+    }*/
     if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       PERF_WRAP(Perf.UpdatePtr.start();)
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
@@ -686,7 +687,7 @@ DCGEN_REPEAT:
             DP("Copying data from device failed.\n");
             return OFFLOAD_FAIL;
           }
-          if (Device.IsMaskEnabled && data_size == sizeof(void*)) {
+          if (Device.IsDCEnabled && data_size == sizeof(void*)) {
             // FIXME what if this is not a address???
             // TODO Add flag
             void *ptr = *(void**)HstPtrBegin;
@@ -1066,10 +1067,16 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     } else {
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
-      if (Device.IsMaskEnabled && _MYMALLOC_ISMYSPACE(HstPtrBegin)) {
-        TgtPtrBegin = (void*)_MYMALLOC_H2D(HstPtrBegin);
-        DP2("omp target launching with myspace arg: %p->%p\n",
-            HstPtrBegin, TgtPtrBegin);
+      if (_MYMALLOC_ISMYSPACE(HstPtrBegin)) {
+        if (Device.IsMaskEnabled) {
+          TgtPtrBegin = (void*)_MYMALLOC_H2D(HstPtrBegin);
+          DP2("omp target launching with myspace arg: %p->%p\n",
+              HstPtrBegin, TgtPtrBegin);
+        } else if (Device.IsOffsetEnabled) {
+          TgtPtrBegin = (void*)((intptr_t)HstPtrBegin +
+              get_offset(get_mm_context(HstPtrBegin)));
+          DP2("Offset: arg of kernel: %p->%p\n", HstPtrBegin, TgtPtrBegin);
+        }
       }
       if (Device.IsBulkEnabled) {
         DP2("IsBulkEnabled 2\n");
@@ -1112,6 +1119,42 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     DP2("Append h2d mask %p to kernel\n", (void*&)_omp_h2dmask);
     tgt_args.push_back((void*)_omp_h2dmask);
     tgt_offsets.push_back(0);
+  }
+  if (Device.IsOffsetEnabled) {
+    static void *t_offset_list = NULL;
+    if (!t_offset_list) {
+      if (getenv("OMP_OFFSET_CM")) {
+        int64_t size;
+        t_offset_list = Device.RTL->get_readonly_mem(&size);
+      } else {
+        t_offset_list = Device.RTL->data_alloc(Device.RTLDeviceID,
+            32*sizeof(intptr_t), NULL);
+      }
+    }
+    intptr_t offset_list[32];
+    int size;
+    // mask
+    offset_list[0] = 0x000000f000000000L;
+    offset_list[1] = 9 * 4;
+    get_offset_table(&size, offset_list + 2);
+    // size
+    if (size < 1) {
+      exit(39);
+    }
+    // print list
+    /*
+    for (int i = 0; i < size + 2; i++) {
+      printf("offset: %zx\n", offset_list[i]);
+    }*/
+    // data_submit
+    int rt = Device.data_submit(t_offset_list, offset_list, sizeof(intptr_t)*(size+4));
+    if (rt != OFFLOAD_SUCCESS) {
+      DP("Map offset list failed\n");
+      return OFFLOAD_FAIL;
+    }
+    tgt_args.push_back(t_offset_list);
+    tgt_offsets.push_back(0);
+    DP2("Append offset list %p to kernel\n", offset_list);
   }
 
   assert(tgt_args.size() == tgt_offsets.size() &&

@@ -237,6 +237,9 @@ struct DeviceTy {
   bool IsNoBulkEnabled;
   bool IsATEnabled;
   bool IsMaskEnabled;
+  bool IsDCEnabled;
+  bool IsOffsetEnabled;
+  bool IsUVMEnabled;
   int32_t suspend_update(void *HstPtrAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase);
   int32_t update_suspend_list();
   int32_t dump_segmentlist();

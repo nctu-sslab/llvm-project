@@ -32,7 +32,12 @@ set(src_files
 add_library(omptarget SHARED ${src_files})
 include_directories(mymalloc)
 include_directories(./)
+#link_directories(/home/pschen/src-pschen/src/llvm-project/openmp/libomptarget/src)
+#uvmmalloc
+list(APPEND CMAKE_PREFIX_PATH "/home/pschen/src-pschen/src/llvm-project/openmp/libomptarget/src/mymalloc")
+find_library(UVM_MALLOC_LIB uvmmalloc)
 target_link_libraries(omptarget
+  ${UVM_MALLOC_LIB}
   ${CMAKE_DL_LIBS}
   "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports")
 

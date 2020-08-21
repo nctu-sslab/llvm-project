@@ -33,7 +33,7 @@ static int insert_new_region(void *begin, size_t size, mmap_region *pos) {
     return -1;
   }
 
-  mmap_region *new_region = (mmap_region *)malloc(sizeof(mmap_region));
+  mmap_region *new_region = (mmap_region *)mallocp(sizeof(mmap_region));
   new_region->begin = (void *)align_begin;
   new_region->end = (void *)align_end;
   new_region->ref_count = 1;

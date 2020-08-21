@@ -268,8 +268,13 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
   } else {
     IsLast = false;
   }
-
   DataMapMtx.unlock();
+
+  if (rc == NULL) {
+    if (IsUVMEnabled) {
+      return HstPtrBegin;
+    }
+  }
   return rc;
 }
 
@@ -283,7 +288,9 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
     uintptr_t tp = HT.TgtPtrBegin + (hp - HT.HstPtrBegin);
     return (void *)tp;
   }
-
+  if (IsUVMEnabled) {
+    return HstPtrBegin;
+  }
   return NULL;
 }
 
@@ -331,15 +338,35 @@ void DeviceTy::init() {
     IsATEnabled = false;
     IsNoBulkEnabled = false;
     IsMaskEnabled = false;
+    IsDCEnabled = false;
+    IsOffsetEnabled = false;
+    IsUVMEnabled = false;
     EnabledOpt.append(" Offloading");
+    if (getenv("OMP_UVM")) {
+      IsUVMEnabled = true;
+      IsDCEnabled = true;
+      goto skip;
+    }
     if (getenv("OMP_MASK")) {
       if (RTL->set_mode) {
         int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_MASK);
         EnabledOpt.append(" AT_MASK");
         IsMaskEnabled = true;
+        IsDCEnabled = true;
         goto skip;
       } else {
-        fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
+        fprintf(stderr, "[omp-dc] RTL set OMP_MASK mode is not supported\n");
+      }
+    }
+    if (getenv("OMP_OFFSET")) {
+      if (RTL->set_mode) {
+        int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_OFFSET);
+        EnabledOpt.append(" AT_OFFSET");
+        IsOffsetEnabled = true;
+        IsDCEnabled = true;
+        goto skip;
+      } else {
+        fprintf(stderr, "[omp-dc] RTL set OMP_OFFMODE_AT_OFFSET mode is not supported\n");
       }
     }
     if (getenv("OMP_BULK") || getenv("OMP_AT")) {
@@ -360,6 +387,9 @@ void DeviceTy::init() {
       }
     }
 skip:
+    if (IsDCEnabled) {
+      EnabledOpt.append(" DeepCopy");
+    }
     if (getenv("PERF")) {
       Perf.init();
       EnabledOpt.append(" OmpProfiling");

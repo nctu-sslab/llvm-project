@@ -97,7 +97,8 @@ enum OpenMPOffloadingRequiresDirFlags {
 enum OpenMPOffloadingMode {
   OMP_OFFMODE_NORMAL              = 0x001,
   OMP_OFFMODE_AT_TABLE            = 0x002,
-  OMP_OFFMODE_AT_MASK             = 0x004
+  OMP_OFFMODE_AT_MASK             = 0x004,
+  OMP_OFFMODE_AT_OFFSET           = 0x008
 };
 
 /// This struct is a record of an entry point or global. For a function

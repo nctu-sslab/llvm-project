@@ -6,6 +6,7 @@
 extern void *(*mallocp)(size_t size);
 extern void *(*reallocp)(void *ptr, size_t size);
 extern void (*freep)(void *);
+extern void *(*callocp)(size_t count, size_t size);
 extern void pragma_omp_enter();
 extern void pragma_omp_exit();
 
@@ -30,6 +31,18 @@ extern struct mallocer mymallocer;
 extern void mymalloc_begin(int64_t deviceID);
 extern void mymalloc_end();
 
+typedef struct heap {
+  void *begin;
+  void *end;
+  void *next_free; // for next fit
+  void *tbegin;
+  size_t page_count;
+  // maybe free count??
+  // Navigator
+  struct heap *next;
+  struct heap *pre;
+} heap_t;
+
 // mmcontext for submit and retrieve
 typedef struct mm_context {
   unsigned int id;
@@ -42,5 +55,9 @@ typedef struct mm_context {
 } mm_context_t;
 
 extern mm_context_t *get_mm_context(void *p);
+
+//extern intptr_t *get_offset_table(int *size);
+extern void get_offset_table(int *size, intptr_t *ret);
+extern intptr_t get_offset(mm_context_t* c);
 
 #endif // __MYMALLOC_H__

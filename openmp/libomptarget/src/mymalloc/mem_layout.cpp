@@ -239,7 +239,7 @@ intptr_t find_mem_hole(pid_t pid) {
   int index_ub = indexs >> trailing0;
 
   // Search from low address, high address like to be heap
-  for (intptr_t i = index_ub - 4; i >= 0; i--) {
+  for (intptr_t i = index_ub - 0x20; i >= 0; i--) {
     // for (intptr_t i = 1; i < index_ub; i++) {
     lseek(mapfd, 0, SEEK_SET);
     intptr_t begin = i << trailing0;

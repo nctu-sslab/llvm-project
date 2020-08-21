@@ -121,6 +121,8 @@ void RTLsTy::LoadRTLs() {
     *((void**) &R.set_mode) = dlsym(
         dynlib_handle, "__tgt_rtl_set_mode");
 
+    *((void**) &R.get_readonly_mem) = dlsym(
+        dynlib_handle, "__tgt_rtl_get_readonly_mem");
 
     // No devices are supported by this RTL?
     if (!(R.NumberOfDevices = R.number_of_devices())) {

@@ -24,8 +24,12 @@
 #include <mutex>
 
 // Store target policy (disabled, mandatory, default)
-kmp_target_offload_kind_t TargetOffloadPolicy = tgt_default;
+// FIXME force mandatory
+kmp_target_offload_kind_t TargetOffloadPolicy = tgt_mandatory;
 std::mutex TargetOffloadMtx;
+
+// TODO Remove me
+static bool UseDC = false;
 
 ////////////////////////////////////////////////////////////////////////////////
 /// manage the success or failure of a target constuct
@@ -84,6 +88,15 @@ EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
   PERF_WRAP(Perf.Runtime.start();)
   RTLs.RegisterLib(desc);
   PERF_WRAP(Perf.Runtime.end();)
+  // FIXME Remove me
+  UseDC = (getenv("OMP_MASK") || getenv("OMP_OFFSET"));
+  // Just init CUDA rtl here
+  int64_t device_id = omp_get_default_device();
+  if (CheckDeviceAndCtors(device_id) != OFFLOAD_SUCCESS) {
+    DP("Failed to get device %" PRId64 " ready\n", device_id);
+    HandleTargetOutcome(false);
+    return;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -363,12 +376,12 @@ EXTERN void __tgt_target_data_declare_begin() {
     return;
   }
   //printf("using device_id %d\n", device_id);
-  if (getenv("OMP_MASK")) {
+  if (UseDC) {
     mymalloc_begin(device_id);
   }
 }
 EXTERN void __tgt_target_data_declare_end() {
-  if (getenv("OMP_MASK")) {
+  if (UseDC) {
     mymalloc_end();
   }
 }

@@ -47,6 +47,7 @@ static int DebugLevel = 0;
     const char *errStr;                                                        \
     cuGetErrorString(err, &errStr);                                            \
     DP("CUDA error is: %s\n", errStr);                                         \
+    fprintf(stderr,"CUDA error is: %s\n", errStr);                             \
   } while (0)
 #else
 #define CUDA_ERR_STRING(err)                                                   \
@@ -69,8 +70,9 @@ enum ExecutionModeType {
 /// Use a single entity to encode a kernel and a set of flags
 struct KernelTy {
   CUfunction Func;
-  CUfunction *TableATFPtr;
-  CUfunction *MaskATFPtr;
+  CUfunction *Func_ATTable;
+  CUfunction *Func_ATMask;
+  CUfunction *Func_ATOffset;
 
   // execution mode of kernel
   // 0 - SPMD mode (without master warp)
@@ -84,10 +86,9 @@ struct KernelTy {
       : Func(_Func), ExecutionMode(_ExecutionMode), KerName(_Name) {}
       */
 
-  KernelTy(CUfunction _Func, int8_t _ExecutionMode, char *_Name
-      ,CUfunction *_ATFuncTable = NULL, CUfunction *_ATFuncMask = NULL)
-      : Func(_Func), ExecutionMode(_ExecutionMode), KerName(_Name)
-        ,TableATFPtr(_ATFuncTable), MaskATFPtr(_ATFuncMask) {}
+  KernelTy(CUfunction _Func, int8_t _ExecutionMode, char *_Name)
+      : Func(_Func), ExecutionMode(_ExecutionMode), KerName(_Name),
+        Func_ATTable(NULL), Func_ATMask(NULL), Func_ATOffset(NULL) {}
 };
 
 /// Device envrionment data
@@ -99,6 +100,9 @@ struct omptarget_device_environmentTy {
 /// List that contains all the kernels.
 /// FIXME: we may need this to be per device and per library.
 std::list<KernelTy> KernelsList;
+
+void *ConstMem = NULL;
+size_t ConstMemSize = 0;
 
 /// Class containing all the device information.
 class RTLDeviceInfoTy {
@@ -424,6 +428,17 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
   DP("CUDA module successfully loaded!\n");
   DeviceInfo.Modules.push_back(cumod);
 
+  if (getenv("OMP_OFFSET_CM")) {
+    err = cuModuleGetGlobal(
+        (CUdeviceptr*)&ConstMem, &ConstMemSize, cumod,"ConstMem");
+    if (err != CUDA_SUCCESS) {
+      fprintf(stderr, "cuda rtl get constmem failed\n");
+      CUDA_ERR_STRING(err);
+    } else {
+      DP("cuda rtl get constmem: %p\n", ConstMem);
+    }
+  }
+
   // Find the symbols in the module by name.
   __tgt_offload_entry *HostBegin = image->EntriesBegin;
   __tgt_offload_entry *HostEnd = image->EntriesEnd;
@@ -491,6 +506,7 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
     CUfunction fun;
     CUfunction *funATTable;
     CUfunction *funATMask;
+    CUfunction *funATOffset;
     bool HasAT = true;
     err = cuModuleGetFunction(&fun, cumod, e->name);
 
@@ -514,14 +530,15 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
 
     if (err != CUDA_SUCCESS) {
       DP("Loading '%s' TableAT ver. (Failed)\n", e->name);
-      CUDA_ERR_STRING(err);
+      // pschen
+      //CUDA_ERR_STRING(err);
       delete funATTable;
       funATTable = NULL;
     } else {
       DP("Entry point " DPxMOD " TableAT ver. maps to %s (" DPxMOD ")\n",
           DPxPTR(e - HostBegin), e->name, DPxPTR(funATTable));
     }
-    // Try Load AT Table function
+    // Try Load AT Mask function
     {
       funATMask = new CUfunction;
       std::string Name(e->name);
@@ -538,6 +555,23 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
       DP("Entry point " DPxMOD " MaskAT ver. maps to %s (" DPxMOD ")\n",
           DPxPTR(e - HostBegin), e->name, DPxPTR(funATMask));
     }
+    // Try Load AT Offset function
+    {
+      funATOffset = new CUfunction;
+      std::string Name(e->name);
+      Name.append("_AT_OFFSET");
+      err = cuModuleGetFunction(funATOffset, cumod, Name.c_str());
+      if (err != CUDA_SUCCESS) {
+        DP("Loading '%s' OffsetAT ver. (Failed)\n", e->name);
+        CUDA_ERR_STRING(err);
+        delete funATOffset;
+        funATOffset = NULL;
+      } else {
+        DP("Entry point " DPxMOD " MaskAT ver. maps to %s (" DPxMOD ")\n",
+            DPxPTR(e - HostBegin), e->name, DPxPTR(funATOffset));
+      }
+    }
+
 
     // default value GENERIC (in case symbol is missing from cubin file)
     int8_t ExecModeVal = ExecutionModeType::GENERIC;
@@ -576,14 +610,11 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
       CUDA_ERR_STRING(err);
     }
 
-    KernelsList.push_back(
-        KernelTy(fun, ExecModeVal, e->name, funATTable, funATMask));
-    /*jhkjjj
-    if (HasAT) {
-    } else {
-      KernelsList.push_back(KernelTy(fun, ExecModeVal, e->name));
-    }
-    */
+    KernelTy K(fun, ExecModeVal, e->name);
+    K.Func_ATTable = funATTable;
+    K.Func_ATMask = funATMask;
+    K.Func_ATOffset = funATOffset;
+    KernelsList.push_back(K);
 
     __tgt_offload_entry entry = *e;
     entry.addr = (void *)&KernelsList.back();
@@ -823,11 +854,15 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
 
   if (DeviceInfo.OffloadMode == OMP_OFFMODE_AT_TABLE) {
     DP("Using AT Table Kernel\n");
-    err = cuLaunchKernel(*KernelInfo->TableATFPtr, cudaBlocksPerGrid, 1, 1,
+    err = cuLaunchKernel(*KernelInfo->Func_ATTable, cudaBlocksPerGrid, 1, 1,
         cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
   } else if (DeviceInfo.OffloadMode == OMP_OFFMODE_AT_MASK) {
     DP("Using AT Mask Kernel\n");
-    err = cuLaunchKernel(*KernelInfo->MaskATFPtr, cudaBlocksPerGrid, 1, 1,
+    err = cuLaunchKernel(*KernelInfo->Func_ATMask, cudaBlocksPerGrid, 1, 1,
+        cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
+  } else if (DeviceInfo.OffloadMode == OMP_OFFMODE_AT_OFFSET) {
+    DP("Using AT Offset Kernel\n");
+    err = cuLaunchKernel(*KernelInfo->Func_ATOffset, cudaBlocksPerGrid, 1, 1,
         cudaThreadsPerBlock, 1, 1, 0 /*bytes of shared memory*/, 0, &args[0], 0);
   } else {
     err = cuLaunchKernel(KernelInfo->Func, cudaBlocksPerGrid, 1, 1,
@@ -872,7 +907,7 @@ int32_t __tgt_rtl_set_mode(int32_t mode) {
       // Check every kernel has AT
       all_kernel_AT = 1;
       for (auto &K : KernelsList) {
-        if (!K.TableATFPtr) {
+        if (!K.Func_ATTable) {
           all_kernel_AT = 0;
         }
       }
@@ -886,7 +921,7 @@ int32_t __tgt_rtl_set_mode(int32_t mode) {
     case OMP_OFFMODE_AT_MASK:
       all_kernel_AT = 1;
       for (auto &K : KernelsList) {
-        if (!K.MaskATFPtr) {
+        if (!K.Func_ATMask) {
           all_kernel_AT = 0;
         }
       }
@@ -896,10 +931,28 @@ int32_t __tgt_rtl_set_mode(int32_t mode) {
         DP("Failed to set rtl mode to OMP_OFFMODE_AT_MASK\n");
         return OFFLOAD_FAIL;
       }
+    case OMP_OFFMODE_AT_OFFSET:
+      all_kernel_AT = 1;
+      for (auto &K : KernelsList) {
+        if (!K.Func_ATOffset) {
+          all_kernel_AT = 0;
+        }
+      }
+      if (all_kernel_AT) {
+        DP("Set rtl mode to OMP_OFFMODE_AT_OFFSET\n");
+      } else {
+        DP("Failed to set rtl mode to OMP_OFFMODE_AT_OFFSET\n");
+        return OFFLOAD_FAIL;
+      }
       break;
   }
   DeviceInfo.OffloadMode = mode;
   return OFFLOAD_SUCCESS;
+}
+
+void *__tgt_rtl_get_readonly_mem(int64_t *size) {
+  *size = (int64_t)ConstMemSize;
+  return ConstMem;
 }
 
 #ifdef __cplusplus

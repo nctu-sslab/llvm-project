@@ -35,4 +35,8 @@ void print_mem_stats(address_range *);
 void print_partial_mem_stats(address_range *);
 void dump_partial_vmmap();
 
+extern void *myrealloc_uvm(void *ptr, size_t size);
+extern void *mymalloc_uvm(size_t size);
+extern void myfree_uvm(void *ptr);
+
 #endif //_MMPRIVATE_H_

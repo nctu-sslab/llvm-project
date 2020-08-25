@@ -22,6 +22,7 @@
 #include <set>
 #include <queue>
 
+#include "omptarget.h"
 #include "mymalloc.h"
 
 // Forward declarations.
@@ -231,15 +232,16 @@ struct DeviceTy {
 
   // pschen custom
   UpdatePtrListTy UpdatePtrList;
-  SegmentListTy SegmentList;
+  SegmentListTy SegmentList; // used in bulk and OMP_OFFMODE_AT_TABLE
+
 
   bool IsBulkEnabled;
   bool IsNoBulkEnabled;
+  // FIXME remove you
   bool IsATEnabled;
-  bool IsMaskEnabled;
-  bool IsDCEnabled;
-  bool IsOffsetEnabled;
   bool IsUVMEnabled;
+  bool IsDCEnabled;
+  OpenMPOffloadingMode ATMode;
   int32_t suspend_update(void *HstPtrAddr, void *HstPtrValue, uint64_t Delta, void *HstPtrBase);
   int32_t update_suspend_list();
   int32_t dump_segmentlist();

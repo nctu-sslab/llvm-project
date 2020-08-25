@@ -30,6 +30,7 @@ std::mutex TargetOffloadMtx;
 
 // TODO Remove me
 static bool UseDC = false;
+static bool IsUVM = false;
 
 ////////////////////////////////////////////////////////////////////////////////
 /// manage the success or failure of a target constuct
@@ -89,7 +90,8 @@ EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
   RTLs.RegisterLib(desc);
   PERF_WRAP(Perf.Runtime.end();)
   // FIXME Remove me
-  UseDC = (getenv("OMP_MASK") || getenv("OMP_OFFSET"));
+  UseDC = (getenv("OMP_MASK") || getenv("OMP_OFFSET") || getenv("OMP_TABLE"));
+  IsUVM = (getenv("OMP_UVM"));
   // Just init CUDA rtl here
   int64_t device_id = omp_get_default_device();
   if (CheckDeviceAndCtors(device_id) != OFFLOAD_SUCCESS) {
@@ -113,6 +115,9 @@ EXTERN void __tgt_unregister_lib(__tgt_bin_desc *desc) {
 /// and passes the data to the device.
 EXTERN void __tgt_target_data_begin(int64_t device_id, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
+  if (IsUVM) {
+    return;
+  }
   if (IsOffloadDisabled()) return;
 
   DP("Entering data begin region for device %" PRId64 " with %d mappings\n",
@@ -166,6 +171,7 @@ EXTERN void __tgt_target_data_begin_nowait(int64_t device_id, int32_t arg_num,
 EXTERN void __tgt_target_data_end(int64_t device_id, int32_t arg_num,
     void **args_base, void **args, int64_t *arg_sizes, int64_t *arg_types) {
   if (IsOffloadDisabled()) return;
+  if (IsUVM) return;
   DP("Entering data end region with %d mappings\n", arg_num);
   PERF_WRAP(Perf.Runtime.start();)
 
@@ -366,6 +372,9 @@ EXTERN void __kmpc_push_target_tripcount(int64_t device_id,
 
 //EXTERN void __tgt_target_data_declare(int64_t device_id)
 EXTERN void __tgt_target_data_declare_begin() {
+  if (IsUVM) {
+    return;
+  }
   int64_t device_id = OFFLOAD_DEVICE_DEFAULT;
   if (device_id == OFFLOAD_DEVICE_DEFAULT) {
     device_id = omp_get_default_device();
@@ -381,6 +390,9 @@ EXTERN void __tgt_target_data_declare_begin() {
   }
 }
 EXTERN void __tgt_target_data_declare_end() {
+  if (IsUVM) {
+    return;
+  }
   if (UseDC) {
     mymalloc_end();
   }

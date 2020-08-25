@@ -355,28 +355,25 @@ DCGEN_REPEAT:
         }
         if (Device.IsDCEnabled && data_size == sizeof(void*)) {
           // FIXME what if this is not a address???
-          // TODO Add flag
+          // TODO Add flag in clang
           void *ptr = *(void**)HstPtrBegin;
+          mm_context_t *context = NULL;
           if (_MYMALLOC_ISMYSPACE(ptr)) {
-            mm_context_t *context = get_mm_context(ptr);
-            if (context) {
-              DP2("Transfer " DPxMOD " with  dc object #%d\n",
-                  DPxPTR(ptr), context->id);
-              rt = context->data_submit();
-              if (rt != OFFLOAD_SUCCESS) {
-                return OFFLOAD_FAIL;
-              }
+            context = get_mm_context(ptr);
+          } else if (Device.ATMode & OMP_OFFMODE_AT_TABLE) {
+            context = get_mm_context(ptr);
+          }
+          if (context) {
+            DP2("Transfer " DPxMOD " with  dc object #%d\n",
+                DPxPTR(ptr), context->id);
+            rt = context->data_submit();
+            if (rt != OFFLOAD_SUCCESS) {
+              return OFFLOAD_FAIL;
             }
           }
-          // check address
         }
       }
     }
-
-    /*
-    if (Device.IsDCEnabled) {
-      goto skip_update;
-    }*/
     if (data_type & OMP_TGT_MAPTYPE_PTR_AND_OBJ) {
       PERF_WRAP(Perf.UpdatePtr.start();)
       DP("Update pointer (" DPxMOD ") -> [" DPxMOD "]\n",
@@ -690,13 +687,19 @@ DCGEN_REPEAT:
           if (Device.IsDCEnabled && data_size == sizeof(void*)) {
             // FIXME what if this is not a address???
             // TODO Add flag
+            mm_context_t *context = NULL;
             void *ptr = *(void**)HstPtrBegin;
-            if (_MYMALLOC_ISMYSPACE(ptr)) {
-              mm_context_t *context = get_mm_context(ptr);
-              if (context) {
-                DP2("Transfer back" DPxMOD " with  dc object #%d\n",
-                    DPxPTR(HstPtrBegin), context->id);
-                context->data_retrieve();
+            if (Device.ATMode & OMP_OFFMODE_AT_TABLE) {
+              context = get_mm_context(ptr);
+            } else if (_MYMALLOC_ISMYSPACE(ptr)) {
+                context = get_mm_context(ptr);
+            }
+            if (context) {
+              DP2("Transfer back" DPxMOD " with  dc object #%d\n",
+                  DPxPTR(HstPtrBegin), context->id);
+              rt = context->data_retrieve();
+              if (rt != OFFLOAD_SUCCESS) {
+                return OFFLOAD_FAIL;
               }
             }
           }
@@ -966,6 +969,7 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
   // List of (first-)private arrays allocated for this target region
   std::vector<void *> fpArrays;
   std::vector<int> tgtArgsPositions(arg_num, -1);
+  std::vector<mm_context_t *> contexts_for_ATTable;
 
   for (int32_t i = 0; i < arg_num; ++i) {
     if (!(arg_types[i] & OMP_TGT_MAPTYPE_TARGET_PARAM)) {
@@ -1068,16 +1072,27 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TgtPtrBegin = Device.getTgtPtrBegin(HstPtrBegin, arg_sizes[i], IsLast,
           false);
       if (_MYMALLOC_ISMYSPACE(HstPtrBegin)) {
-        if (Device.IsMaskEnabled) {
+        if (Device.ATMode & OMP_OFFMODE_AT_MASK) {
           TgtPtrBegin = (void*)_MYMALLOC_H2D(HstPtrBegin);
           DP2("omp target launching with myspace arg: %p->%p\n",
               HstPtrBegin, TgtPtrBegin);
-        } else if (Device.IsOffsetEnabled) {
+        } else if (Device.ATMode & OMP_OFFMODE_AT_OFFSET) {
           TgtPtrBegin = (void*)((intptr_t)HstPtrBegin +
               get_offset(get_mm_context(HstPtrBegin)));
           DP2("Offset: arg of kernel: %p->%p\n", HstPtrBegin, TgtPtrBegin);
         }
       }
+        if (TgtPtrBegin == NULL && (Device.ATMode & OMP_OFFMODE_AT_TABLE)) {
+          mm_context_t *context;
+          heap_t *heap = get_heap(HstPtrBegin, &context);
+          if (heap && heap->tbegin) {
+            TgtPtrBegin = (void*)((uintptr_t)heap->tbegin -
+                (uintptr_t)heap->begin + (uintptr_t)HstPtrBegin);
+            // Add context to table
+            contexts_for_ATTable.push_back(context);
+          }
+          DP2("OMP_TABLE need to translate NULL args %p\n", TgtPtrBegin);
+        }
       if (Device.IsBulkEnabled) {
         DP2("IsBulkEnabled 2\n");
         TgtPtrBegin = Device.bulkGetTgtPtrBegin(HstPtrBegin, arg_sizes[i]);
@@ -1103,25 +1118,65 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     tgt_offsets.push_back(TgtBaseOffset);
   }
   // Insert  table
+  /*
   if (Device.IsATEnabled) {
     tgt_args.push_back(Device.SegmentList.TgtMemPtr);
     tgt_offsets.push_back(0);
-    // check the data on gpu
-    /*int size = Device.SegmentList.TgtList.size();
-    SegmentTy TmpTable[size];
-    Device.data_retrieve(TmpTable, Device.SegmentList.TgtMemPtr, size*sizeof(SegmentTy));
-    for (int i = 0; i < size; i++) {
-      TmpTable[i].dump();
-    }*/
+  }*/
+  if (Device.ATMode & OMP_OFFMODE_AT_TABLE) {
+    printf("Constructing  tableATTable\n");
+    SegmentListTy &SegmentList = Device.SegmentList;
+    SegmentList.clear();
+    for (auto e : contexts_for_ATTable) {
+      printf("construct with context %d\n", e->id);
+      heap_t *first_heap = e->heap_list;
+      heap_t *curr_heap = first_heap;
+      do {
+        if (!curr_heap->tbegin) {
+          curr_heap = curr_heap->next;
+          continue;
+        }
+        SegmentTy seg;
+        seg.HstPtrBegin = (uintptr_t)curr_heap->begin;
+        seg.HstPtrEnd =  (uintptr_t)curr_heap->end;
+        seg.TgtPtrBegin = (uintptr_t)curr_heap->tbegin;
+        SegmentList.emplace((uintptr_t)curr_heap->begin,
+            seg);
+        curr_heap = curr_heap->next;
+        printf("push hst: 0x%p 0x%p\n", (void*)seg.HstPtrBegin, (void*)seg.TgtPtrBegin);
+      } while(first_heap != curr_heap);
+    }
+    SegmentTy seg;
+    seg.HstPtrBegin = (uintptr_t)SegmentList.size();
+    SegmentList.TgtList.emplace_back(seg);
+    for (auto &entry : SegmentList) {
+      auto &e = entry.second;
+      //printf("%lu %lu %lu\n", e.HstPtrBegin, e.HstPtrEnd, e.TgtPtrBegin);
+      SegmentList.TgtList.push_back(e);
+    }
+    printf("AT Table size: %lu\n", SegmentList.size());
+    SegmentList.TgtMemPtr = Device.RTL->data_alloc(Device.RTLDeviceID,
+        SegmentList.size()*sizeof(SegmentTy), NULL);
+    int rt = Device.data_submit(SegmentList.TgtMemPtr,
+        &SegmentList.TgtList[0],
+        SegmentList.size() * sizeof(SegmentTy));
+    if (rt != OFFLOAD_SUCCESS) {
+      DP("Transfer AT table failed\n");
+      return OFFLOAD_FAIL;
+    }
+    // insert arg
+    tgt_args.push_back(SegmentList.TgtMemPtr);
+    tgt_offsets.push_back(0);
   }
+
   // Insert Mask
-  if (Device.IsMaskEnabled) {
+  if (Device.ATMode & OMP_OFFMODE_AT_MASK) {
     DP2("Append h2d mask %p to kernel\n", (void*&)_omp_h2dmask);
     tgt_args.push_back((void*)_omp_h2dmask);
     tgt_offsets.push_back(0);
   }
-  if (Device.IsOffsetEnabled) {
-    static void *t_offset_list = NULL;
+  if (Device.ATMode & OMP_OFFMODE_AT_OFFSET) {
+    void *t_offset_list = NULL;
     if (!t_offset_list) {
       if (getenv("OMP_OFFSET_CM")) {
         int64_t size;
@@ -1129,23 +1184,21 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       } else {
         t_offset_list = Device.RTL->data_alloc(Device.RTLDeviceID,
             32*sizeof(intptr_t), NULL);
+        Device.SegmentList.TgtMemPtr = t_offset_list;
       }
     }
     intptr_t offset_list[32];
     int size;
+    // Here is hardcode
     // mask
     offset_list[0] = 0x000000f000000000L;
+    // shift
     offset_list[1] = 9 * 4;
     get_offset_table(&size, offset_list + 2);
     // size
     if (size < 1) {
       exit(39);
     }
-    // print list
-    /*
-    for (int i = 0; i < size + 2; i++) {
-      printf("offset: %zx\n", offset_list[i]);
-    }*/
     // data_submit
     int rt = Device.data_submit(t_offset_list, offset_list, sizeof(intptr_t)*(size+4));
     if (rt != OFFLOAD_SUCCESS) {
@@ -1169,6 +1222,10 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
       TargetTable->EntriesBegin[TM->Index].name,
       DPxPTR(TargetTable->EntriesBegin[TM->Index].addr), TM->Index);
   DP2("Launch kernel\n");
+  // print args
+  for (auto arg : tgt_args) {
+    DP2("     Arg: " DPxMOD "\n", DPxPTR(arg));
+  }
   if (IsTeamConstruct) {
     rc = Device.run_team_region(TargetTable->EntriesBegin[TM->Index].addr,
         &tgt_args[0], &tgt_offsets[0], tgt_args.size(), team_num,
@@ -1189,6 +1246,18 @@ int target(int64_t device_id, void *host_ptr, int32_t arg_num,
     if (rt != OFFLOAD_SUCCESS) {
       DP("Deallocation of (first-)private arrays failed.\n");
       return OFFLOAD_FAIL;
+    }
+  }
+  // Deallocate table for AT
+  if (Device.ATMode & (OMP_OFFMODE_AT_TABLE | OMP_OFFMODE_AT_OFFSET)) {
+    if (Device.SegmentList.TgtMemPtr) {
+      int rt = Device.RTL->data_delete(Device.RTLDeviceID,
+          Device.SegmentList.TgtMemPtr);
+      if (rt != OFFLOAD_SUCCESS) {
+        DP("Deallocation AT table failed.\n");
+        return OFFLOAD_FAIL;
+      }
+      Device.SegmentList.TgtMemPtr = NULL;
     }
   }
 

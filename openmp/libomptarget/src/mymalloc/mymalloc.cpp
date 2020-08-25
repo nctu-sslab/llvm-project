@@ -58,7 +58,10 @@ mm_context_t *curr_context;
 uint16_t context_count = 0;
 static char inited = 0;
 static bool IsMaskEnabled = false;
+static bool IsOffsetEnabled = false;
+
 static bool using_uvm = false;
+static bool FixedHeap = false;
 
 // pointer to default allocators
 void *(*mallocp)(size_t size) = NULL;
@@ -175,16 +178,18 @@ __attribute__((constructor)) static void init() {
     mymallocp = mymalloc_uvm;
     myfreep = myfree_uvm;
     myreallocp = myrealloc_uvm;
+    use_default = false;
 #endif
   } else {
     mymallocp = mymalloc;
     myfreep = myfree;
     myreallocp = myrealloc;
   }
-  if (getenv("OMP_MASK")) {
-    IsMaskEnabled = 1;
-  } else {
-    IsMaskEnabled = 0;
+  if (getenv("OMP_OFFSET")) {
+    FixedHeap = true;
+    IsOffsetEnabled = true;
+  } else if (getenv("OMP_MASK")) {
+    IsMaskEnabled = true;
   }
   inited = 1;
 }
@@ -201,23 +206,27 @@ static heap_t *new_heap(int page_count) {
   ret->tbegin = NULL;
   ret->page_count = page_count;
   size_t size = page_count * PAGE_SIZE;
+  void *get_new = NULL;
 
 
-  // size_t actual_size = PAGE_ALIGN(size + sizeof(struct header));
   // FIXME
-  void *dptr =
-      curr_context->RTL->data_alloc(curr_context->device_id, size, NULL);
+  if (IsMaskEnabled) {
+    void *dptr =
+        curr_context->RTL->data_alloc(curr_context->device_id, size, NULL);
+    void *d2h_ptr = (void *)(_omp_d2hmask & (uintptr_t)dptr);
 
-  void *d2h_ptr = (void *)(_omp_d2hmask & (uintptr_t)dptr);
-
-  // align to page size
-  int mmap_ret = mmap_region_register(d2h_ptr, size);
-  if (mmap_ret) {
-    puts("mmap_region_register failed");
-    exit(90);
+    // align to page size
+    int mmap_ret = mmap_region_register(d2h_ptr, size);
+    if (mmap_ret) {
+      puts("mmap_region_register failed");
+      exit(90);
+    }
+    get_new = d2h_ptr;
+  } else {
+    get_new = mallocp(size);
   }
 
-  ret->begin = d2h_ptr;
+  ret->begin = get_new;
   ret->next_free = ret->begin;
   ret->end = (void *)((char *)ret->begin + size);
   // init first blk
@@ -277,7 +286,7 @@ static blk_hdr_t *find_next_fit(size_t size) {
     }
     curr_blk = (blk_hdr_t *)((char *)curr_blk + (curr_blk->size & ~1L));
   }
-  if (!IsMaskEnabled) {
+  if (FixedHeap) {
     // Just enlarge the current heap
     void *new_end;
     //printf("curr heap begin %p\n", curr_heap->begin);
@@ -336,7 +345,7 @@ void context_create(int64_t device_id) {
   curr_context->id = cid;
 
   heap_t *heap_new;
-  if (IsMaskEnabled) {
+  if (!FixedHeap) {
     heap_new = new_heap(0);
   } else {
     void *begin = (void*)((cid * CONTEXT_SIZE) | _omp_check_mask);
@@ -469,7 +478,6 @@ int32_t mm_context_t::data_submit() {
     count++;
     PERF_WRAP(Perf.H2DTransfer.start();)
     void *hbegin = curr->begin;
-
     void *tbegin;
     // FIXME next_free is not always the end
     int64_t size = (uintptr_t)curr->next_free - (uintptr_t)hbegin;
@@ -505,7 +513,7 @@ end:
   //return 0;
 }
 int32_t mm_context_t::data_retrieve() {
-  DP2("Obj#%d data_submit\n", id);
+  DP2("Obj#%d data_retrieve\n", id);
   static unsigned int count = 0;
   heap_t *first = heap_list;
   heap_t *curr = first;
@@ -539,18 +547,12 @@ end:
 }
 
 mm_context_t *get_mm_context(void *p) {
-  if (!_MYMALLOC_ISMYSPACE(p)) {
-    return NULL;
-  }
-  if (IsMaskEnabled) {
-    static unsigned int count = 0;
+  if (!FixedHeap) {
     for (int i = 0; i < context_count; i++) {
       heap_t *first = contexts[i].heap_list;
       heap_t *curr = first;
       do  {
-        count++;
         if (p >= curr->begin && p < curr->end) {
-          DP2("get_mm_context accum search count: %d\n", count);
           return &contexts[i];
         }
         curr = curr->next;
@@ -562,9 +564,29 @@ mm_context_t *get_mm_context(void *p) {
     return contexts + id;
   }
 }
+heap_t *get_heap(void *p, mm_context_t **return_context) {
+  if (!FixedHeap) {
+      //printf("get_heap %p\n", p);
+    for (int i = 0; i < context_count; i++) {
+      heap_t *first = contexts[i].heap_list;
+      heap_t *curr = first;
+      //printf("search context %d\n", i);
+      do {
+        //printf("curr: %p-%p\n", curr->begin, curr->end);
+        if (p >= curr->begin && p < curr->end) {
+          *return_context = &contexts[i];
+          return curr;
+        }
+        curr = curr->next;
+      } while(curr != first);
+    }
+    return NULL;
+  }
+  exit(33);
+}
 
 void get_offset_table(int *size, intptr_t *ret) {
-  if (!IsMaskEnabled) {
+  if (IsOffsetEnabled) {
     *size = context_count;
     //intptr_t *ret = mallocp((context_count -1) * sizeof(intptr_t));
     for (int i = 0; i < context_count; i++) {
@@ -572,17 +594,17 @@ void get_offset_table(int *size, intptr_t *ret) {
       ret[i] = get_offset(c);
     }
   } else {
-    *size = -1;
+    exit(89);
   }
 }
 
 intptr_t get_offset(mm_context_t *context) {
-  if (!IsMaskEnabled) {
+  if (IsOffsetEnabled) {
     heap_t *h = context->heap_list;
     intptr_t ret = (intptr_t)h->tbegin - (intptr_t)h->begin;
     //printf("get_offset: %p-%p %p", h->tbegin, h->begin, (void*)ret);
     return ret;
   } else {
-    return 0;
+    exit(88);
   }
 }

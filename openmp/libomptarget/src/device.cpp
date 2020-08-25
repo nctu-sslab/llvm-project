@@ -272,6 +272,7 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size, bool &IsLast,
 
   if (rc == NULL) {
     if (IsUVMEnabled) {
+      DP2("[UVM] Bypassing " DPxMOD "\n", DPxPTR(HstPtrBegin));
       return HstPtrBegin;
     }
   }
@@ -289,6 +290,7 @@ void *DeviceTy::getTgtPtrBegin(void *HstPtrBegin, int64_t Size) {
     return (void *)tp;
   }
   if (IsUVMEnabled) {
+    DP2("[UVM] Bypassing " DPxMOD "\n", DPxPTR(HstPtrBegin));
     return HstPtrBegin;
   }
   return NULL;
@@ -334,41 +336,54 @@ void DeviceTy::init() {
   int32_t rc = RTL->init_device(RTLDeviceID);
   if (rc == OFFLOAD_SUCCESS) {
     string EnabledOpt;
+    /*
+  OMP_OFFMODE_AT_TABLE            = 0x002,
+  OMP_OFFMODE_AT_MASK             = 0x004,
+  OMP_OFFMODE_AT_OFFSET           = 0x008
+  */
     IsBulkEnabled = false;
     IsATEnabled = false;
     IsNoBulkEnabled = false;
-    IsMaskEnabled = false;
     IsDCEnabled = false;
-    IsOffsetEnabled = false;
     IsUVMEnabled = false;
+    ATMode = OMP_OFFMODE_NORMAL;
     EnabledOpt.append(" Offloading");
     if (getenv("OMP_UVM")) {
       IsUVMEnabled = true;
       IsDCEnabled = true;
       goto skip;
     }
-    if (getenv("OMP_MASK")) {
-      if (RTL->set_mode) {
+    if (RTL->set_mode) {
+      if (getenv("OMP_MASK")) {
         int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_MASK);
+        if (ret != OFFLOAD_SUCCESS) {
+          goto skip;
+        }
         EnabledOpt.append(" AT_MASK");
-        IsMaskEnabled = true;
         IsDCEnabled = true;
-        goto skip;
-      } else {
-        fprintf(stderr, "[omp-dc] RTL set OMP_MASK mode is not supported\n");
-      }
-    }
-    if (getenv("OMP_OFFSET")) {
-      if (RTL->set_mode) {
+        ATMode = OMP_OFFMODE_AT_MASK;
+        DP2("SET OMP_OFFMODE_AT_MASK\n");
+      } else if (getenv("OMP_OFFSET")) {
         int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_OFFSET);
+        if (ret != OFFLOAD_SUCCESS) {
+          goto skip;
+        }
         EnabledOpt.append(" AT_OFFSET");
-        IsOffsetEnabled = true;
         IsDCEnabled = true;
-        goto skip;
-      } else {
-        fprintf(stderr, "[omp-dc] RTL set OMP_OFFMODE_AT_OFFSET mode is not supported\n");
+        ATMode = OMP_OFFMODE_AT_OFFSET;
+        DP2("SET OMP_OFFMODE_AT_OFFSET\n");
+      } else if (getenv("OMP_TABLE")) {
+        int32_t ret = RTL->set_mode(OMP_OFFMODE_AT_TABLE);
+        if (ret != OFFLOAD_SUCCESS) {
+          goto skip;
+        }
+        EnabledOpt.append(" AT_TABLE");
+        IsDCEnabled = true;
+        ATMode = OMP_OFFMODE_AT_TABLE;
+        DP2("SET OMP_OFFMODE_AT_TABLE\n");
       }
     }
+    /*
     if (getenv("OMP_BULK") || getenv("OMP_AT")) {
       EnabledOpt.append(" BulkTransfer");
       IsBulkEnabled = true;
@@ -386,6 +401,7 @@ void DeviceTy::init() {
         fprintf(stderr, "[omp-dc] RTL set mode is not supported\n");
       }
     }
+    */
 skip:
     if (IsDCEnabled) {
       EnabledOpt.append(" DeepCopy");

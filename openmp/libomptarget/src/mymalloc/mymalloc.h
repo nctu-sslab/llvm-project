@@ -21,13 +21,6 @@ extern uintptr_t _omp_d2hmask; // | index
 extern uintptr_t _omp_check_mask;
 extern uintptr_t _omp_header_mask;
 
-/*
-typedef struct mallocer {
-  int8_t use_default_alloc;
-} mallocer_t;
-extern struct mallocer mymallocer;
-*/
-
 extern void mymalloc_begin(int64_t deviceID);
 extern void mymalloc_end();
 
@@ -43,7 +36,7 @@ typedef struct heap {
   struct heap *pre;
 } heap_t;
 
-// mmcontext for submit and retrieve
+// mm_context for submit and retrieve
 typedef struct mm_context {
   unsigned int id;
   int64_t device_id;
@@ -55,6 +48,7 @@ typedef struct mm_context {
 } mm_context_t;
 
 extern mm_context_t *get_mm_context(void *p);
+extern heap_t *get_heap(void*p, mm_context_t **return_context);
 
 //extern intptr_t *get_offset_table(int *size);
 extern void get_offset_table(int *size, intptr_t *ret);

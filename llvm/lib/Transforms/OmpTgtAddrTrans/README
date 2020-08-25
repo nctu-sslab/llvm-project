@@ -1,6 +1,7 @@
-# TODO
+# This pass will be compiled into llvm default workflow of nvptx target
+# A llvm module is also compiled for fast testing
 
-* Install the obj to build dir
+
 
 # Commnad
 

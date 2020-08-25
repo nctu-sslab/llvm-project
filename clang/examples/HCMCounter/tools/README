@@ -1,0 +1,18 @@
+# Get effort
+
+# get oringin files
+get-nooffload.sh
+
+# Remove tool files
+
+# Copy corresponding files to dirs
+
+# Modify with diff result
+
+# get wdiff of each file
+# gen basename.c.wdiff
+mywdiff f1.c f2.c
+
+# get result
+# gen output.json
+collectAllWdiff.sh

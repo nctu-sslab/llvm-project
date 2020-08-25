@@ -12,7 +12,7 @@ endif()
 add_llvm_library(HCMCounter MODULE HCMCounter.cpp PLUGIN_TOOL clang)
 
 if(LLVM_ENABLE_PLUGINS AND (WIN32 OR CYGWIN))
-    target_link_libraries(OpenMPRewrite PRIVATE
+    target_link_libraries(HCMCounter PRIVATE
     clangAST
     clangBasic
     clangFrontend

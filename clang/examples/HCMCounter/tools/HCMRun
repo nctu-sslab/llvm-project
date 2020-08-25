@@ -46,3 +46,5 @@ $cc -fsyntax-only -I. -I/home/pschen/llvm/thesis/build-Debug/include -Xclang -lo
 HCMCompare.py out-$file1d.json out-$file.json
 
 rm out-$file1d.json out-$file.json diff.log diffline1 diffline2
+
+#$cc -fsyntax-only -I. -I $LLVM_BUILD_PATH/include -Xclang -load -Xclang $LLVM_BUILD_PATH/lib/HCMCounter.so -Xclang -plugin -Xclang hcm -Xclang -plugin-arg-hcm -Xclang 2 -Xclang -plugin-arg-hcm -Xclang diffline2 $file  > out-$file.json

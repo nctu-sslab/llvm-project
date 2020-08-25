@@ -16,6 +16,7 @@ def merge(substrs):
     return final
 
 def extract_new(text):
+    text = text.replace('\r', ' ').replace('\n', ' ')
     x = re.findall("\[\-.*?\-\]", text)
     x2 = re.findall("\{\+.*?\+\}", text)
     print(merge(x) + merge(x2))

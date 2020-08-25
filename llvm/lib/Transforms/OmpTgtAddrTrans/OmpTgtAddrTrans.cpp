@@ -84,6 +84,12 @@ namespace {
   const int MaxATTableSize = 20;
   const int ATTableEntyNum = sizeof(struct ATTableTy) / sizeof(uintptr_t);
 
+  struct InsertionAT {
+    Instruction* I;
+    Value *Addr;
+  };
+  typedef map<Function*, vector<InsertionAT>> HostAddrInsts;
+
   struct InfoPerFunc {
     set<User*> TracedUserList;
     map<Instruction*, Instruction*> TranslatedResult;
@@ -116,13 +122,20 @@ namespace {
     // offset value   0x0000200000000000L
     ConstantInt *Offset0x20;
 
-    Function *ATFuncTable;
-    Function *StoreTableFunc;
-    Function *ATFuncMask;
-    Function *StoreMaskFunc;
-    Function *ATFuncOffset;
-    Function *ATFuncOffset2;
+
+    Function *ATFuncTable_tab;    // void *(void *, struct ATTableTy*)
+
+    Function *ATFuncTable;        // void *(void *)
+    Function *StoreTableFunc;     // pre-store table
+
+    // Index-based
+    Function *ATFuncOffset;       // void *(void *, intptr_t *)
     Function *StoreOffsetFunc;
+    // Index-based-opt
+    Function *ATFuncOffset2;      // void *(void *, intptr_t *) using constant mem
+
+    // Mask-based
+    Function *ATFuncMask;         // void *(void *)
 
     // llvm Module
     Module *module;
@@ -166,7 +179,7 @@ namespace {
 //    void naiveAT(Function *);
     vector<Value *> getSourceValues(User *U);
     void traceArgInFunc(Function *, Argument*, ATVer Opt);
-    //Instruction *insertATFuncBefore(Instruction *I, Value *Ptr, set<User*> &UserList);
+    Instruction *insertATFuncBefore2(Instruction *I, Value *Ptr);
     Instruction *insertATFuncAfter(Value *V, set<User*> &UserList, bool DoReplaceAll = false);
     //Instruction *insertMaskingAfter(Value *V, set<User*> &UserList, bool DoReplaceAll = false);
 
@@ -181,10 +194,14 @@ namespace {
     int16_t doSharedMemOpt();
     Function *genFakeLoadFunc(LoadInst *LI);
     Function *replaceLoad(LoadInst *LI);
+
+    void getHostAddrInsts(Function *F, Argument*, HostAddrInsts &);
     void epilogue();
 
     // Helper function
     string printFunction(Function *F);
+    string strFunc(Function *F);
+    string strVal(Value *V);
   };
 
   class RestoreLoad : public ModulePass {
@@ -232,7 +249,7 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   // check omp_offload.info metadata to skip normal cuda complilation
   if (!M.getNamedMetadata("omp_offload.info")) {
     // TODO
-    //return FAILED;
+    return FAILED;
   }
   // Use a metadata to avoid double application
   string PassMetadata("omp_offload.OmpTgtAddrTrans");
@@ -264,6 +281,7 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   IT32 = IntegerType::get(*context, 32);
   ITptr = IntegerType::get(*context, DL.getPointerSizeInBits());
   PTptr = PointerType::get(ITptr, 0);
+  AddrType = PointerType::get(IT8, 0);
 
   // Create TableTy
   vector<Type*> StructMem;
@@ -274,9 +292,9 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
       "struct.ATTableTy", false);
   ATTablePtrType = PointerType::getUnqual(ATTableType);
 
-  // Create Address Translation function (table ver)
-  AddrType = PointerType::get(IT8, 0);
   vector<Type*> ParamTypes;
+  // Create Address Translation function (table ver)
+  ParamTypes.clear();
   ParamTypes.push_back(AddrType);
   FunctionType *ATFuncTableTy = FunctionType::get(
       AddrType, ParamTypes, false);
@@ -285,12 +303,26 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   // Set pure function attribute to open optimization
   ATFuncTable->addFnAttr(Attribute::ReadNone);
 
+  // Create Address Translation function (table ver) with table arg
+  ParamTypes.clear();
+  ParamTypes.push_back(AddrType);
+  ParamTypes.push_back(ATTablePtrType);
+  FunctionType *ATFuncTable_tabTy = FunctionType::get(
+      AddrType, ParamTypes, false);
+  ATFuncTable_tab = Function::Create(
+      ATFuncTable_tabTy, GlobalValue::ExternalLinkage, "AddrTransTable2", M);
+  ATFuncTable_tab->addFnAttr(Attribute::ReadNone);
+
   // Create AT func (mask ver)
+  ParamTypes.clear();
+  ParamTypes.push_back(AddrType);
   ATFuncMask = Function::Create(
       ATFuncTableTy, GlobalValue::ExternalLinkage, "AddrTransMask", M);
   ATFuncMask->addFnAttr(Attribute::ReadNone);
 
-  // Create offset version AT func
+  // Create offset(index) version AT func
+  ParamTypes.clear();
+  ParamTypes.push_back(AddrType);
   ParamTypes.push_back(PTptr);
   FunctionType *ATFuncOffsetTy = FunctionType::get(
       AddrType, ParamTypes, false);
@@ -314,10 +346,8 @@ int8_t OmpTgtAddrTrans::init(Module &M) {
   FunctionType *STSFuncTy = FunctionType::get(ATTablePtrType, ParamTypes, false);
   StoreTableFunc = Function::Create(STSFuncTy, GlobalValue::ExternalLinkage,
       "StoreTableShared", M);
-  FunctionType *SMFTy = FunctionType::get(Type::getVoidTy(*context),
-      ITptr, false);
-  StoreMaskFunc = Function::Create(SMFTy, GlobalValue::ExternalLinkage,
-      "StoreMaskShared", M);
+  //FunctionType *SMFTy = FunctionType::get(Type::getVoidTy(*context),
+  //    ITptr, false);
 
   // Mask0x7f init
   Mask0x7f = ConstantInt::get(ITptr, 0x00007f0000000000L);
@@ -421,7 +451,7 @@ int ConcurrentAT::doConcurrentAT(Function *F) {
           continue;
         }
         Function *Callee = CI->getCalledFunction();
-        if (Callee == ATFuncTable) {
+        if (false/*Callee == ATFuncTable*/) {
           CI->dump();
           bool ret = isRelated(CI, TidRelatedValues);
           if (ret) {
@@ -454,6 +484,26 @@ string OmpTgtAddrTrans::printFunction(Function *F) {
     itr->print(s);
   }
   s << ")";
+  return str;
+}
+string OmpTgtAddrTrans::strFunc(Function *F) {
+  string str;
+  raw_string_ostream s(str);
+  s << F->getName() << "(";
+  for (auto itr = F->arg_begin(); itr != F->arg_end(); itr++) {
+    if (itr != F->arg_begin()) {
+      s << ", ";
+    }
+    itr->print(s);
+  }
+  s << ") ";
+  return str;
+}
+string OmpTgtAddrTrans::strVal(Value *V) {
+  string str;
+  raw_string_ostream s(str);
+  V->print(s);
+  s << " ";
   return str;
 }
 
@@ -1055,7 +1105,8 @@ void OmpTgtAddrTrans::traceArgInFunc(
 // TODO Load only once for same addr
 //void OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Use *PtrUse, set<User*> &UserList) {
 /*
-Instruction *OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAddr, set<User*> &UserList) {
+Instruction *OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst,
+    Value *PtrAddr) {
   InsertedATCount++;
   // old version
   //Argument *ATTableArg = getFuncTableArg(Inst->getFunction());
@@ -1086,7 +1137,72 @@ Instruction *OmpTgtAddrTrans::insertATFuncBefore(Instruction *Inst, Value *PtrAd
   UserList.insert(CI);
   UserList.insert(PostCastI);
   return PostCastI;
+  fuck
 }*/
+Instruction *OmpTgtAddrTrans::insertATFuncBefore2(Instruction *Inst,
+    Value *PtrAddr) {
+  InsertedATCount++;
+  dp () << "@Insert translate before Inst: ";
+  Inst->print(dp());
+  dp() << "\n";
+  // insert bitcast
+  // Dummy cast as tmp for replace all
+
+  Instruction *PreCastI, *TransI, *PostCastI;
+  if (CurATMode == OMP_AT_MASK) {
+    // MaskNoArg
+    PreCastI = new PtrToIntInst(PtrAddr, ITptr, "PreMaskCast");
+    TransI = BinaryOperator::Create(
+        BinaryOperator::Or ,Mask0x7f, PreCastI, "Masked");
+    TransI->setMetadata("at", ATMD);
+    PostCastI = new IntToPtrInst(TransI, Inst->getType(), "PreMaskCast");
+    goto END;
+  } else if (CurATMode == OMP_AT_OFFSET) {
+    PreCastI = CastInst::Create(Instruction::BitCast, PtrAddr,
+        AddrType, "PreATCast");
+    vector<Value*> Args;
+    Args.push_back(PreCastI);
+    Args.push_back(getATArg(Inst->getFunction()));
+    if (getenv("OMP_OFFSET_CM")) {
+      TransI = CallInst::Create(FunctionCallee(ATFuncOffset2),
+          Args, "TransResult");
+      // NOTE OFFset2 2nd arg is not used
+    } else {
+      TransI = CallInst::Create(FunctionCallee(ATFuncOffset),
+          Args, "TransResult");
+    }
+    TransI->setMetadata("at", ATMD);
+    PostCastI = CastInst::Create(Instruction::BitCast, TransI,
+        PtrAddr->getType(), "PostATCast");
+    goto END;
+  }
+
+  {
+  PreCastI = CastInst::Create(Instruction::BitCast, PtrAddr,
+      AddrType, "PreATCast");
+  vector<Value*> Args;
+  Args.push_back(PreCastI);
+#if 1
+  Args.push_back(getATArg(Inst->getFunction()));
+  TransI = CallInst::Create(FunctionCallee(ATFuncTable_tab),
+      Args, "TransResult");
+#else
+  /* no table arg type */
+  TransI = CallInst::Create(FunctionCaln(ATFuncTable,Args, "TransResult");
+#endif
+  TransI->setMetadata("at", ATMD);
+  PostCastI = CastInst::Create(Instruction::BitCast, TransI,
+      PtrAddr->getType(), "PostATCast");
+  }
+END:
+  if (Instruction *I = dyn_cast<Instruction>(PtrAddr)) {
+    PostCastI->insertAfter(I);
+    TransI->insertAfter(I);
+    PreCastI->insertAfter(I);
+  }
+  Inst->replaceUsesOfWith (PtrAddr, PostCastI);
+  return PostCastI;
+}
 
 Instruction *OmpTgtAddrTrans::insertATFuncAfter(Value *V, set<User*> &UserList,
     bool DoReplaceAll) {
@@ -1117,29 +1233,14 @@ Instruction *OmpTgtAddrTrans::insertATFuncAfter(Value *V, set<User*> &UserList,
         AddrType, "PreATCast");
     vector<Value*> Args;
     Args.push_back(PreCastI);
-    /*
-    if (getenv("OMP_OFFSET_CM")) {
-      // Cast
-      PTptr->dump();
-      PointerType *PT = PointerType::get(ITptr, 4);
-      PT->dump();
-      CuConstMem->getType()->dump();
-      CastInst *C = CastInst::Create(Instruction::BitCast, CuConstMem,
-          PT, "CM", Inst);
-      C->dump();
-      AddrSpaceCastInst *ASCI = new AddrSpaceCastInst(C, PTptr, "CM2", C);
-      ASCI->dump();
-      Args.push_back();
-    } else {
-    }*/
     Args.push_back(getATArg(Inst->getFunction()));
     if (getenv("OMP_OFFSET_CM")) {
-      TransI = CallInst::Create(ATFuncOffset2->getFunctionType(), ATFuncOffset2,
-            Args, "TransResult");
-      // FIXME OFFset2 don't send arg
+      TransI = CallInst::Create(FunctionCallee(ATFuncOffset2),
+          Args, "TransResult");
+      // NOTE OFFset2 2nd arg is not used
     } else {
-      TransI = CallInst::Create(ATFuncOffset->getFunctionType(), ATFuncOffset,
-            Args, "TransResult");
+      TransI = CallInst::Create(FunctionCallee(ATFuncOffset),
+          Args, "TransResult");
     }
     PostCastI = CastInst::Create(Instruction::BitCast, TransI,
         V->getType(), "PostATCast");
@@ -1151,8 +1252,14 @@ Instruction *OmpTgtAddrTrans::insertATFuncAfter(Value *V, set<User*> &UserList,
       AddrType, "PreATCast");
   vector<Value*> Args;
   Args.push_back(PreCastI);
-  TransI = CallInst::Create(ATFuncTable->getFunctionType(), ATFuncTable,
+#if 1
+  Args.push_back(getATArg(Inst->getFunction()));
+  TransI = CallInst::Create(FunctionCallee(ATFuncTable_tab),
       Args, "TransResult");
+#else
+  /* no table arg type */
+  TransI = CallInst::Create(FunctionCaln(ATFuncTable,Args, "TransResult");
+#endif
   TransI->setMetadata("at", ATMD);
   PostCastI = CastInst::Create(Instruction::BitCast, TransI,
       V->getType(), "PostATCast");
@@ -1487,24 +1594,6 @@ int16_t OmpTgtAddrTrans::doSharedMemOpt() {
     DummyInst->dropAllReferences();
     DummyInst->eraseFromParent();
   }
-  // MaskVer
-  /* MaskNoArg MaskNoSM
-  for (auto E : FunctionTransEntry) {
-    Function *F = E.second[OMP_AT_MASK];
-    Instruction *FirstInst = &*F->begin()->begin();
-    vector<Value*> StoreMaskFuncArgs;
-    Value *ATArg = getATArg(F);
-    StoreMaskFuncArgs.push_back(ATArg);
-
-    CallInst *Call = CallInst::Create(
-        StoreMaskFunc->getFunctionType(), StoreMaskFunc,
-
-    //auto *DummyInst = new AllocaInst(ATArg->getType(), 0, "dummy", &F->front());
-    auto *DummyInst = new BitCastInst(ATArg, ATArg->getType(), "dummy", &F->front());
-    ATArg->replaceAllUsesWith(DummyInst);
-        StoreMaskFuncArgs, Twine(), FirstInst);
-  }
-  */
   return SUCCESS;
 }
 
@@ -1514,13 +1603,94 @@ Argument *OmpTgtAddrTrans::getATArg(Function *F) {
   Argument *ATTableArg = F->arg_end() - 1;
   return ATTableArg;
 }
+struct PtrInfo {
+  Value *V;
+  unsigned DevicePtrDepth;
+  PtrInfo(Value *V, unsigned D): V(V), DevicePtrDepth(D){
+    dp() << "Taint Value: ";
+    V->print(dp());
+    dp() << "\n";
+  };
+  PtrInfo(Value *V): V(V), DevicePtrDepth(0){
+    dp() << "Taint Value: ";
+    V->print(dp());
+    dp() << "\n";
+  };
+};
+
+// FIXME how to swap callinst
+void OmpTgtAddrTrans::getHostAddrInsts(Function *F,
+    Argument* Arg, HostAddrInsts &CPUInsts) {
+  dp() << "\ngetHostAddrInsts on " << strFunc(F) << strVal(Arg) << "\n";
+  auto &CPUInstList = CPUInsts[F];
+  queue<PtrInfo> Vals;
+  Vals.push({Arg, 1});
+
+  while (!Vals.empty()) {
+    PtrInfo Taint = Vals.front();
+    Vals.pop();
+    Taint.V->dump();
+    unsigned Depth = Taint.DevicePtrDepth;
+    for (auto &use : Taint.V->uses()) {
+      User *user = use.getUser();
+      user->dump();
+      if (CallInst *CI = dyn_cast<CallInst>(user)) {
+        unsigned ArgIdx = use.getOperandNo();
+        Function *F = CI->getCalledFunction();
+        if (F->isIntrinsic()) {
+          continue;
+        }
+        //TODO mark try to swap call inst
+        getHostAddrInsts(F, F->arg_begin() + ArgIdx, CPUInsts);
+        if (typeContainPtr(CI->getType())) {
+          Vals.push({CI});
+        }
+      } else if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(user)) {
+        if (GEPI->getPointerOperand() == use.get()) {
+          if (typeContainPtr(GEPI->getType())) {
+            Vals.push({GEPI});
+          }
+        }
+      } else if (LoadInst *LI = dyn_cast<LoadInst>(user)) {
+        if (Depth == 0) {
+          dp() << "Requires AT " << strVal(LI) << "\n";
+          CPUInstList.push_back({LI,use.get()});
+        }
+        if (typeContainPtr(LI->getType())) {
+          Vals.push({LI});
+        }
+      } else if (StoreInst *SI = dyn_cast<StoreInst>(user)) {
+        if (SI->getPointerOperand() == use.get()) {
+          if (Depth == 0) {
+            dp() << "Requires AT " << strVal(SI) << "\n";
+            CPUInstList.push_back({SI,use.get()});
+          }
+        } else {
+          // FIXME avoid inf loop??
+          llvm::errs() << "StoreInst store taint value";
+          exit(38);
+        }
+      } else if (MemCpyInst *MI = dyn_cast<MemCpyInst>(user)) {
+        /*
+        unsigned ArgIdx = use.getOperandNo();
+        if (ArgIdx == 0) {
+
+        }*/
+      } else {
+        llvm::errs() << "Error: unknown instruction";
+        user->print(llvm::errs());
+        llvm::errs() << "n";
+      }
+    }
+  }
+}
 
 bool OmpTgtAddrTrans::runOnModule(Module &M) {
   dp() << "Entering OmpTgtAddrTrans\n";
   IsDebug = (bool) getenv("DP2");
   //IsNaiveAT = (bool) getenv("OMP_NAIVE_AT");
   //EnableAS = (bool) getenv("LLVM_AS");
-  DisableFakeLoad = (bool) getenv("OMP_NOFL");
+  DisableFakeLoad = true;//(bool) getenv("OMP_NOFL");
   bool changed = false;
 
   if (init(M)) {
@@ -1536,6 +1706,119 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
   } else {
     dp() << "No entry function(kernel\n";
     return changed;
+  }
+
+  if (getenv("OMP_NEW_AT")) {
+    dp() << "OMP_NEW_AT\n";
+    // Find insertion point first
+    HostAddrInsts InstList;
+    for (auto E : FunctionTransEntry) {
+      Function *F = E.first;
+      // All pointer args of entry function is CPU address
+      for (size_t i = 0; i < F->arg_size(); i++) {
+        Argument *Arg = F->arg_begin() + i;
+        if (isArgNeedAT(Arg)) {
+          getHostAddrInsts(F, Arg, InstList);
+        }
+      }
+    }
+    //goto skip_old;
+    // beforehand insertion??
+
+    dp() << "Finished getHostAddrInsts\n";
+    for (auto entry : InstList) {
+      if (entry.second.size() == 0) {
+        continue;
+      }
+      // Do real clone and insertion here??
+      dp() << strFunc(entry.first) << "\n";
+      dp() << "there are " << entry.second.size() << "AT\n";
+      for (auto &Insertion : entry.second) {
+        dp() << strVal(Insertion.I) << "\n";
+      }
+    }
+
+    // clone functions
+    for (auto E : FunctionTransEntry) {
+      Function *F = E.first;
+      FunctionTransEntry[F] = cloneFuncWithATArg(F);
+    }
+    addEntryFunctionsAsKernel(FunctionTransEntry);
+    for (auto E : InstList) {
+      Function *F = E.first;
+      // check is entry
+      if (FunctionTransEntry.find(F) != FunctionTransEntry.end()) {
+        continue;
+      }
+      FunctionTrans[F] = cloneFuncWithATArg(F);
+    }
+      // get all callinst
+    auto swapCallInstLamdda = [&](FunctionMapTy &Map) {
+    for (auto E : Map) {
+      ATFunctionSet &FS = E.second;
+      for (auto entry : FS) {
+        auto scheme = entry.first;
+        Function *F = FS[scheme];
+
+        vector<CallInst*> CallInstToSwap;
+        for (auto &BB: *F) {
+          for (auto &I : BB) {
+            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+              if (isa<IntrinsicInst>(CI)) {
+                continue;
+              }
+              Function *Callee = CI->getCalledFunction();
+              if (FunctionTrans.find(Callee) == FunctionTrans.end()) {
+                continue;
+              }
+              CallInstToSwap.push_back(CI);
+              //if (isFunctionUseAT())
+            }
+          }
+        }
+        for (auto CI : CallInstToSwap) {
+          swapCallInst(CI, scheme);
+        }
+      }
+    }
+    };
+    swapCallInstLamdda(FunctionTransEntry);
+    swapCallInstLamdda(FunctionTrans);
+
+    //    insert AT
+    //    Iterate scheme
+    vector<enum ATVer> Schemes;
+    //Schemes.push_back(OMP_AT_TABLE);
+    //Schemes.push_back(OMP_AT_MASK);
+    Schemes.push_back(OMP_AT_OFFSET);
+    for (auto scheme : Schemes) {
+      InstList.clear();
+      CurATMode = scheme;
+      for (auto E : FunctionTransEntry) {
+        Function *F = FunctionTransEntry[E.first][scheme];
+        // All pointer args of entry function is CPU address
+        for (size_t i = 0; i < F->arg_size()-1/*NOTE -1*/; i++) {
+          Argument *Arg = F->arg_begin() + i;
+          if (isArgNeedAT(Arg)) {
+            getHostAddrInsts(F, Arg, InstList);
+          }
+        }
+      }
+      for (auto E : InstList) {
+        Function *F = E.first;
+        vector<InsertionAT> &inserts = E.second;
+        // for each scheme
+        // FIXME no search entry func
+        for (auto &insert : inserts) {
+          // insert
+          insert.Addr->dump();
+          insert.I->dump();
+          // FIXME prevent duplicate insert
+          insertATFuncBefore2(insert.I, insert.Addr);
+        }
+      }
+    }
+    goto skip_old;
   }
 
   for (auto E : FunctionTransEntry) {
@@ -1573,10 +1856,11 @@ bool OmpTgtAddrTrans::runOnModule(Module &M) {
       }
     }
   }
+skip_old:
   epilogue();
 
 
-  doSharedMemOpt();
+  //doSharedMemOpt();
   dp() << "Inserted " << InsertedATCount << " address tranlation\n";
   dp() << "OmpTgtAddrTrans Finished\n";
 
@@ -1773,6 +2057,7 @@ ModulePass *llvm::createConcurrentATPass() {
 #endif
 
 //  Add pass dependency
+//  at
 //INITIALIZE_PASS_BEGIN(OmpTgtAddrTrans, "OmpTgtAddrTrans", "Description TODO", false, false)
 //INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
 //INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
